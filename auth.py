@@ -10,8 +10,8 @@ import hmac
 import os
 import time
 
+import bcrypt
 from jose import jwt, JWTError
-from passlib.context import CryptContext
 
 SECRET_KEY = os.getenv("AUTH_SECRET_KEY")
 if not SECRET_KEY:
@@ -25,17 +25,18 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")  # тот же токен, чт
 ALGORITHM = "HS256"
 TOKEN_LIFETIME_SECONDS = 30 * 24 * 60 * 60  # 30 дней
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 
 # ==================== Пароли ====================
+# Используем bcrypt напрямую (без passlib) — passlib давно не обновлялся
+# и несовместим с новыми версиями bcrypt.
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+    return hashed.decode("utf-8")
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return pwd_context.verify(password, password_hash)
+    return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
 
 
 # ==================== JWT-токены ====================
