@@ -18,8 +18,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("Не найден DATABASE_URL — проверь переменные окружения")
 
-# Timeweb (как и многие провайдеры) может выдавать строку вида "postgres://",
-# а SQLAlchemy с психопг2 хочет "postgresql://" — подстрахуемся
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -33,11 +31,9 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, index=True)
 
-    # Вход по email — оба поля могут быть NULL, если человек вошёл только через Telegram
     email = Column(String, unique=True, index=True, nullable=True)
     password_hash = Column(String, nullable=True)
 
-    # Вход через Telegram — тоже может быть NULL, если человек регистрировался только по email
     telegram_id = Column(String, unique=True, index=True, nullable=True)
     telegram_username = Column(String, nullable=True)
     telegram_first_name = Column(String, nullable=True)
