@@ -59,6 +59,7 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     history: list[ChatMessage]  # вся история диалога, присылает сайт
+    role: str | None = None  # выбранный "характер" общения (см. ai_service.ROLE_CONFIG)
 
 
 class TranslateRequest(BaseModel):
@@ -216,7 +217,7 @@ async def chat(
 ):
     """Обычный чат с ботом. Требует авторизации, чтобы сохранять историю за конкретным пользователем."""
     history = [m.model_dump() for m in req.history]
-    reply = ai_service.get_chat_reply(history)
+    reply = ai_service.get_chat_reply(history, role=req.role)
 
     if history:
         last_user_message = history[-1]
@@ -225,6 +226,19 @@ async def chat(
     db.commit()
 
     return {"reply": reply}
+
+
+@app.get("/api/chat/roles")
+async def chat_roles():
+    """Список доступных 'характеров' общения — для отрисовки выбора на сайте."""
+    return {
+        role_id: {
+            "label": cfg["label"],
+            "emoji": cfg["emoji"],
+            "description": cfg["description"],
+        }
+        for role_id, cfg in ai_service.ROLE_CONFIG.items()
+    }
 
 
 @app.get("/api/history")
