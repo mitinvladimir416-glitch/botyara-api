@@ -3,3 +3,8 @@ uvicorn[standard]
 groq
 python-dotenv
 python-multipart
+sqlalchemy
+psycopg2-binary
+passlib[bcrypt]
+python-jose[cryptography]
+email-validator
