@@ -74,7 +74,11 @@ def verify_telegram_login(data: dict) -> bool:
     if not received_hash:
         return False
 
-    check_fields = {k: v for k, v in data.items() if k != "hash"}
+    # Telegram присылает только реально заполненные поля (например, если у пользователя
+    # нет username или фото — этих ключей вообще не будет). А наш код (FastAPI/Pydantic)
+    # всегда добавляет такие поля со значением None — их обязательно нужно убрать перед
+    # проверкой подписи, иначе строка для проверки не совпадёт с тем, что подписал Telegram.
+    check_fields = {k: v for k, v in data.items() if k != "hash" and v is not None}
     data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(check_fields.items()))
 
     secret_key = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode()).digest()
