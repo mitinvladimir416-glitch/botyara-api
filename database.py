@@ -45,14 +45,17 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     favorites = relationship("Favorite", back_populates="user", cascade="all, delete-orphan")
+    messages = relationship("Message", back_populates="user", cascade="all, delete-orphan")
 
 
 class Favorite(Base):
     __tablename__ = "favorites"
+
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
     user = relationship("User", back_populates="favorites")
 
 
@@ -67,6 +70,7 @@ class Message(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="messages")
+
 
 def init_db():
     """Создаёт таблицы, если их ещё нет. Вызывается один раз при старте приложения."""
