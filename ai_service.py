@@ -44,6 +44,12 @@ ROLE_COMMON_RULES = (
 )
 
 ROLE_CONFIG = {
+    "default": {
+        "label": "Обычный помощник",
+        "emoji": "🤖",
+        "description": "нейтрально, по делу, без выраженного характера",
+        "system_prompt": "Ты дружелюбный ассистент, отвечай кратко и по делу на русском языке.",
+    },
     "friend": {
         "label": "Лучший друг",
         "emoji": "🧑‍🤝‍🧑",
@@ -112,7 +118,7 @@ ROLE_CONFIG = {
     },
 }
 
-DEFAULT_ROLE = "friend"
+DEFAULT_ROLE = "default"
 
 
 def clean_reply(text: str) -> str:
