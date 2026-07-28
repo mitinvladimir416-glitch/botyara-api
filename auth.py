@@ -84,6 +84,14 @@ def verify_telegram_login(data: dict) -> bool:
     secret_key = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode()).digest()
     computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
 
+    # ВРЕМЕННАЯ ОТЛАДКА — уберём после того, как разберёмся с ошибкой входа через Telegram
+    print("=== DEBUG telegram login ===")
+    print("received data:", data)
+    print("data_check_string:", repr(data_check_string))
+    print("computed_hash:", computed_hash)
+    print("received_hash:", received_hash)
+    print("=============================")
+
     if computed_hash != received_hash:
         return False
 
