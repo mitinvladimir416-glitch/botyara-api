@@ -103,6 +103,11 @@ class FavoriteCreateRequest(BaseModel):
     content: str
 
 
+class LinkEmailRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
 class FavoriteUpdateRequest(BaseModel):
     content: str
 
@@ -376,6 +381,30 @@ async def get_me(current_user: User = Depends(get_current_user)):
         "telegram_username": current_user.telegram_username,
         "telegram_first_name": current_user.telegram_first_name,
     }
+
+
+@app.post("/api/me/link-email")
+async def link_email(
+    req: LinkEmailRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Добавляет email и пароль к уже залогиненному аккаунту (например, вошедшему через Telegram) —
+    чтобы в дальнейшем можно было зайти в тот же аккаунт по email, если Telegram недоступен.
+    """
+    if current_user.email:
+        raise HTTPException(status_code=400, detail="К этому аккаунту уже привязан email")
+
+    existing = db.query(User).filter(User.email == req.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Этот email уже используется другим аккаунтом")
+
+    current_user.email = req.email
+    current_user.password_hash = auth.hash_password(req.password)
+    db.commit()
+
+    return {"status": "ok", "email": current_user.email}
 
 
 # ==================== Избранное (требует авторизации сайта) ====================
