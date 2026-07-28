@@ -12,8 +12,9 @@ API-сервер для сайта botyara.ru.
 
 import base64
 import logging
+import os
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -21,11 +22,15 @@ from sqlalchemy.orm import Session
 
 import ai_service
 import auth
-from database import get_db, init_db, User, Favorite
+from database import get_db, init_db, User, Favorite, Message
 
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Botyara API", version="0.2.0")
+
+# Секрет для проверки, что запросы на /api/bot/* приходят именно от нашего Telegram-бота,
+# а не от кого попало. Должен совпадать со значением BOT_INTERNAL_SECRET в Railway (у бота).
+BOT_INTERNAL_SECRET = os.getenv("BOT_INTERNAL_SECRET")
 
 
 @app.on_event("startup")
@@ -98,6 +103,22 @@ class FavoriteCreateRequest(BaseModel):
     content: str
 
 
+class BotMessageRequest(BaseModel):
+    # Поля, которые присылает бот про пользователя Telegram
+    telegram_id: int
+    telegram_username: str | None = None
+    telegram_first_name: str | None = None
+    role: str  # "user" или "assistant"
+    content: str
+
+
+class BotFavoriteRequest(BaseModel):
+    telegram_id: int
+    telegram_username: str | None = None
+    telegram_first_name: str | None = None
+    content: str
+
+
 # ==================== Авторизация: вспомогательное ====================
 
 security = HTTPBearer(auto_error=False)
@@ -121,6 +142,46 @@ def get_current_user(
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise HTTPException(status_code=401, detail="Пользователь не найден")
+
+    return user
+
+
+def verify_bot_secret(x_bot_secret: str | None = Header(default=None)):
+    """
+    Зависимость FastAPI: проверяет, что запрос на /api/bot/* пришёл от нашего бота
+    (секрет передаётся в заголовке X-Bot-Secret и должен совпадать с BOT_INTERNAL_SECRET).
+    """
+    if not BOT_INTERNAL_SECRET:
+        raise HTTPException(status_code=500, detail="BOT_INTERNAL_SECRET не настроен на сервере")
+    if x_bot_secret != BOT_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="Неверный секрет бота")
+
+
+def get_or_create_bot_user(
+    db: Session, telegram_id: int, telegram_username: str | None, telegram_first_name: str | None
+) -> User:
+    """
+    Находит пользователя по telegram_id, а если такого ещё нет — создаёт нового.
+    Используется эндпоинтами /api/bot/*, чтобы сообщения и избранное из бота
+    попадали к тому же пользователю, что и на сайте.
+    """
+    telegram_id_str = str(telegram_id)
+    user = db.query(User).filter(User.telegram_id == telegram_id_str).first()
+
+    if user is None:
+        user = User(
+            telegram_id=telegram_id_str,
+            telegram_username=telegram_username,
+            telegram_first_name=telegram_first_name,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    else:
+        # Обновляем актуальные данные профиля на случай, если человек их поменял в Telegram
+        user.telegram_username = telegram_username
+        user.telegram_first_name = telegram_first_name
+        db.commit()
 
     return user
 
@@ -282,7 +343,7 @@ async def get_me(current_user: User = Depends(get_current_user)):
     }
 
 
-# ==================== Избранное (требует авторизации) ====================
+# ==================== Избранное (требует авторизации сайта) ====================
 
 @app.get("/api/favorites")
 async def list_favorites(
@@ -342,3 +403,52 @@ async def clear_favorites(
     db.query(Favorite).filter(Favorite.user_id == current_user.id).delete()
     db.commit()
     return {"status": "cleared"}
+
+
+# ==================== Эндпоинты для бота (требуют секрет BOT_INTERNAL_SECRET) ====================
+
+@app.post("/api/bot/message", dependencies=[Depends(verify_bot_secret)])
+async def bot_save_message(req: BotMessageRequest, db: Session = Depends(get_db)):
+    """
+    Бот вызывает это после каждого сообщения (своего и ответа нейросети),
+    чтобы история попадала в общую базу и была видна на сайте.
+    """
+    user = get_or_create_bot_user(db, req.telegram_id, req.telegram_username, req.telegram_first_name)
+
+    message = Message(user_id=user.id, role=req.role, content=req.content, source="bot")
+    db.add(message)
+    db.commit()
+
+    return {"status": "ok"}
+
+
+@app.get("/api/bot/history/{telegram_id}", dependencies=[Depends(verify_bot_secret)])
+async def bot_get_history(telegram_id: int, db: Session = Depends(get_db)):
+    """
+    Возвращает всю сохранённую историю переписки пользователя (из бота и с сайта вместе),
+    отсортированную по времени. Пригодится дальше, когда будем синхронизировать историю чата.
+    """
+    user = db.query(User).filter(User.telegram_id == str(telegram_id)).first()
+    if user is None:
+        return {"history": []}
+
+    messages = (
+        db.query(Message)
+        .filter(Message.user_id == user.id)
+        .order_by(Message.created_at.asc())
+        .all()
+    )
+    return {"history": [{"role": m.role, "content": m.content} for m in messages]}
+
+
+@app.post("/api/bot/favorite", dependencies=[Depends(verify_bot_secret)])
+async def bot_add_favorite(req: BotFavoriteRequest, db: Session = Depends(get_db)):
+    """Бот вызывает это, когда пользователь жмёт '⭐ Сохранить в избранное' — сохраняет в общую БД."""
+    user = get_or_create_bot_user(db, req.telegram_id, req.telegram_username, req.telegram_first_name)
+
+    favorite = Favorite(user_id=user.id, content=req.content)
+    db.add(favorite)
+    db.commit()
+    db.refresh(favorite)
+
+    return {"id": favorite.id, "content": favorite.content, "created_at": favorite.created_at}
