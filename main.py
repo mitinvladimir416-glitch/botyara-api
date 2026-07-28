@@ -103,6 +103,10 @@ class FavoriteCreateRequest(BaseModel):
     content: str
 
 
+class FavoriteUpdateRequest(BaseModel):
+    content: str
+
+
 class BotMessageRequest(BaseModel):
     # Поля, которые присылает бот про пользователя Telegram
     telegram_id: int
@@ -117,6 +121,11 @@ class BotFavoriteRequest(BaseModel):
     telegram_username: str | None = None
     telegram_first_name: str | None = None
     content: str
+
+
+class BotFavoriteDeleteRequest(BaseModel):
+    telegram_id: int
+    favorite_id: int
 
 
 # ==================== Авторизация: вспомогательное ====================
@@ -195,11 +204,37 @@ async def health():
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
-    """Обычный чат с ботом."""
+async def chat(
+    req: ChatRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Обычный чат с ботом. Требует авторизации, чтобы сохранять историю за конкретным пользователем."""
     history = [m.model_dump() for m in req.history]
     reply = ai_service.get_chat_reply(history)
+
+    if history:
+        last_user_message = history[-1]
+        db.add(Message(user_id=current_user.id, role="user", content=last_user_message["content"], source="web"))
+    db.add(Message(user_id=current_user.id, role="assistant", content=reply, source="web"))
+    db.commit()
+
     return {"reply": reply}
+
+
+@app.get("/api/history")
+async def get_history(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Возвращает всю сохранённую историю переписки текущего пользователя (из бота и с сайта вместе)."""
+    messages = (
+        db.query(Message)
+        .filter(Message.user_id == current_user.id)
+        .order_by(Message.created_at.asc())
+        .all()
+    )
+    return {"history": [{"role": m.role, "content": m.content} for m in messages]}
 
 
 @app.post("/api/translate")
@@ -374,6 +409,28 @@ async def add_favorite(
     return {"id": favorite.id, "content": favorite.content, "created_at": favorite.created_at}
 
 
+@app.patch("/api/favorites/{favorite_id}")
+async def update_favorite(
+    favorite_id: int,
+    req: FavoriteUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Редактирует текст сохранённого промпта (только свой)."""
+    favorite = (
+        db.query(Favorite)
+        .filter(Favorite.id == favorite_id, Favorite.user_id == current_user.id)
+        .first()
+    )
+    if not favorite:
+        raise HTTPException(status_code=404, detail="Не найдено")
+
+    favorite.content = req.content
+    db.commit()
+    db.refresh(favorite)
+    return {"id": favorite.id, "content": favorite.content, "created_at": favorite.created_at}
+
+
 @app.delete("/api/favorites/{favorite_id}")
 async def delete_favorite(
     favorite_id: int,
@@ -452,3 +509,40 @@ async def bot_add_favorite(req: BotFavoriteRequest, db: Session = Depends(get_db
     db.refresh(favorite)
 
     return {"id": favorite.id, "content": favorite.content, "created_at": favorite.created_at}
+
+
+@app.get("/api/bot/favorites/{telegram_id}", dependencies=[Depends(verify_bot_secret)])
+async def bot_list_favorites(telegram_id: int, db: Session = Depends(get_db)):
+    """Возвращает список избранного пользователя вместе с настоящими ID из базы —
+    боту это нужно, чтобы показывать промпты по одному и удалять их индивидуально."""
+    user = db.query(User).filter(User.telegram_id == str(telegram_id)).first()
+    if user is None:
+        return {"favorites": []}
+
+    favorites = (
+        db.query(Favorite)
+        .filter(Favorite.user_id == user.id)
+        .order_by(Favorite.created_at.desc())
+        .all()
+    )
+    return {"favorites": [{"id": f.id, "content": f.content} for f in favorites]}
+
+
+@app.post("/api/bot/favorite/delete", dependencies=[Depends(verify_bot_secret)])
+async def bot_delete_favorite(req: BotFavoriteDeleteRequest, db: Session = Depends(get_db)):
+    """Удаляет один промпт из избранного по его ID (только если он принадлежит этому telegram_id)."""
+    user = db.query(User).filter(User.telegram_id == str(req.telegram_id)).first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+    favorite = (
+        db.query(Favorite)
+        .filter(Favorite.id == req.favorite_id, Favorite.user_id == user.id)
+        .first()
+    )
+    if not favorite:
+        raise HTTPException(status_code=404, detail="Не найдено")
+
+    db.delete(favorite)
+    db.commit()
+    return {"status": "deleted"}
