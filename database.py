@@ -49,14 +49,24 @@ class User(Base):
 
 class Favorite(Base):
     __tablename__ = "favorites"
-
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-
     user = relationship("User", back_populates="favorites")
 
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    role = Column(String, nullable=False)      # "user" или "assistant"
+    content = Column(Text, nullable=False)
+    source = Column(String, nullable=False)    # "bot" или "web" — откуда пришло сообщение
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="messages")
 
 def init_db():
     """Создаёт таблицы, если их ещё нет. Вызывается один раз при старте приложения."""
