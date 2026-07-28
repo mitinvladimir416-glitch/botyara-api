@@ -86,6 +86,8 @@ def verify_telegram_login(data: dict) -> bool:
 
     # ВРЕМЕННАЯ ОТЛАДКА — уберём после того, как разберёмся с ошибкой входа через Telegram
     print("=== DEBUG telegram login ===")
+    print("TELEGRAM_BOT_TOKEN repr:", repr(TELEGRAM_BOT_TOKEN))
+    print("TELEGRAM_BOT_TOKEN length:", len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0)
     print("received data:", data)
     print("data_check_string:", repr(data_check_string))
     print("computed_hash:", computed_hash)
