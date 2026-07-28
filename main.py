@@ -216,13 +216,24 @@ async def chat(
     db: Session = Depends(get_db),
 ):
     """Обычный чат с ботом. Требует авторизации, чтобы сохранять историю за конкретным пользователем."""
+    persona = req.role or "default"
     history = [m.model_dump() for m in req.history]
     reply = ai_service.get_chat_reply(history, role=req.role)
 
     if history:
         last_user_message = history[-1]
-        db.add(Message(user_id=current_user.id, role="user", content=last_user_message["content"], source="web"))
-    db.add(Message(user_id=current_user.id, role="assistant", content=reply, source="web"))
+        db.add(
+            Message(
+                user_id=current_user.id,
+                role="user",
+                content=last_user_message["content"],
+                source="web",
+                persona=persona,
+            )
+        )
+    db.add(
+        Message(user_id=current_user.id, role="assistant", content=reply, source="web", persona=persona)
+    )
     db.commit()
 
     return {"reply": reply}
@@ -230,7 +241,7 @@ async def chat(
 
 @app.get("/api/chat/roles")
 async def chat_roles():
-    """Список доступных 'характеров' общения — для отрисовки выбора на сайте."""
+    """Список доступных 'характеров' общения — для отрисовки вкладок на сайте."""
     return {
         role_id: {
             "label": cfg["label"],
@@ -243,17 +254,51 @@ async def chat_roles():
 
 @app.get("/api/history")
 async def get_history(
+    persona: str | None = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Возвращает всю сохранённую историю переписки текущего пользователя (из бота и с сайта вместе)."""
-    messages = (
-        db.query(Message)
-        .filter(Message.user_id == current_user.id)
-        .order_by(Message.created_at.asc())
-        .all()
-    )
+    """
+    Возвращает сохранённую историю переписки текущего пользователя.
+    Если передан параметр persona — только сообщения этой вкладки/роли (плюс старые сообщения
+    без persona, если запрошена вкладка "default" — они считаются обычным общением).
+    Если persona не передан — возвращает всё вместе (для обратной совместимости).
+    """
+    query = db.query(Message).filter(Message.user_id == current_user.id)
+
+    if persona:
+        if persona == "default":
+            query = query.filter((Message.persona == "default") | (Message.persona.is_(None)))
+        else:
+            query = query.filter(Message.persona == persona)
+
+    messages = query.order_by(Message.created_at.asc()).all()
     return {"history": [{"role": m.role, "content": m.content} for m in messages]}
+
+
+@app.delete("/api/history")
+async def clear_history(
+    persona: str | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Очищает историю переписки. Если передан persona — только эту вкладку/роль
+    (для вкладки "default" это общая с ботом история — она тоже очистится).
+    Если persona не передан — очищает вообще всё.
+    """
+    query = db.query(Message).filter(Message.user_id == current_user.id)
+
+    if persona:
+        if persona == "default":
+            query = query.filter((Message.persona == "default") | (Message.persona.is_(None)))
+        else:
+            query = query.filter(Message.persona == persona)
+
+    query.delete(synchronize_session=False)
+    db.commit()
+    return {"status": "cleared"}
+
 
 
 @app.post("/api/translate")
@@ -515,7 +560,7 @@ async def bot_save_message(req: BotMessageRequest, db: Session = Depends(get_db)
     """
     user = get_or_create_bot_user(db, req.telegram_id, req.telegram_username, req.telegram_first_name)
 
-    message = Message(user_id=user.id, role=req.role, content=req.content, source="bot")
+    message = Message(user_id=user.id, role=req.role, content=req.content, source="bot", persona="default")
     db.add(message)
     db.commit()
 
