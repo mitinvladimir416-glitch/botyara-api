@@ -109,6 +109,11 @@ class LinkEmailRequest(BaseModel):
     password: str
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
 class FavoriteUpdateRequest(BaseModel):
     content: str
 
@@ -464,6 +469,26 @@ async def link_email(
     db.commit()
 
     return {"status": "ok", "email": current_user.email}
+
+
+@app.post("/api/me/change-password")
+async def change_password(
+    req: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Меняет пароль уже привязанного email. Требует ввести текущий пароль для подтверждения."""
+    if not current_user.password_hash:
+        raise HTTPException(
+            status_code=400, detail="У аккаунта ещё нет пароля — сначала привяжи email в разделе Аккаунт"
+        )
+    if not auth.verify_password(req.current_password, current_user.password_hash):
+        raise HTTPException(status_code=401, detail="Неверный текущий пароль")
+
+    current_user.password_hash = auth.hash_password(req.new_password)
+    db.commit()
+
+    return {"status": "ok"}
 
 
 # ==================== Избранное (требует авторизации сайта) ====================
