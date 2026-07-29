@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 import ai_service
 import auth
-from database import get_db, init_db, User, Favorite, Message
+from database import get_db, init_db, User, Favorite, Message, GalleryPost, GalleryComment
 
 logging.basicConfig(level=logging.INFO)
 
@@ -141,6 +141,29 @@ class BotFavoriteDeleteRequest(BaseModel):
     favorite_id: int
 
 
+class GalleryPublishRequest(BaseModel):
+    favorite_id: int
+
+
+class GalleryCommentRequest(BaseModel):
+    content: str
+
+
+class BotGalleryPublishRequest(BaseModel):
+    telegram_id: int
+    telegram_username: str | None = None
+    telegram_first_name: str | None = None
+    content: str
+
+
+class BotGalleryCommentRequest(BaseModel):
+    telegram_id: int
+    telegram_username: str | None = None
+    telegram_first_name: str | None = None
+    post_id: int
+    content: str
+
+
 # ==================== Авторизация: вспомогательное ====================
 
 security = HTTPBearer(auto_error=False)
@@ -206,6 +229,15 @@ def get_or_create_bot_user(
         db.commit()
 
     return user
+
+
+def author_display_name(user: User) -> str:
+    """Имя автора для показа в галерее — Telegram-имя, иначе часть email, иначе 'Аноним'."""
+    if user.telegram_first_name:
+        return user.telegram_first_name
+    if user.email:
+        return user.email.split("@")[0]
+    return "Аноним"
 
 
 # ==================== Эндпоинты ====================
@@ -624,6 +656,140 @@ async def clear_favorites(
     return {"status": "cleared"}
 
 
+# ==================== Галерея промптов (требует авторизации сайта) ====================
+
+@app.post("/api/gallery/publish")
+async def gallery_publish(
+    req: GalleryPublishRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Публикует промпт из Избранного в общую галерею — проходит модерацию перед публикацией."""
+    favorite = (
+        db.query(Favorite)
+        .filter(Favorite.id == req.favorite_id, Favorite.user_id == current_user.id)
+        .first()
+    )
+    if not favorite:
+        raise HTTPException(status_code=404, detail="Такого промпта нет в твоём избранном")
+
+    allowed, reason = ai_service.moderate_text(favorite.content)
+    post = GalleryPost(
+        user_id=current_user.id,
+        content=favorite.content,
+        status="approved" if allowed else "rejected",
+        reject_reason=None if allowed else reason,
+    )
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return {"id": post.id, "status": post.status, "reject_reason": post.reject_reason}
+
+
+@app.get("/api/gallery")
+async def gallery_list(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Список опубликованных (прошедших модерацию) промптов, новые сверху."""
+    posts = (
+        db.query(GalleryPost)
+        .filter(GalleryPost.status == "approved")
+        .order_by(GalleryPost.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    result = []
+    for p in posts:
+        comment_count = (
+            db.query(GalleryComment)
+            .filter(GalleryComment.post_id == p.id, GalleryComment.status == "approved")
+            .count()
+        )
+        result.append(
+            {
+                "id": p.id,
+                "content": p.content,
+                "author": author_display_name(p.user),
+                "created_at": p.created_at,
+                "comment_count": comment_count,
+                "is_mine": p.user_id == current_user.id,
+            }
+        )
+    return result
+
+
+@app.get("/api/gallery/{post_id}")
+async def gallery_detail(
+    post_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Один пост галереи целиком, вместе со всеми одобренными комментариями."""
+    post = db.query(GalleryPost).filter(GalleryPost.id == post_id, GalleryPost.status == "approved").first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Пост не найден")
+
+    comments = (
+        db.query(GalleryComment)
+        .filter(GalleryComment.post_id == post_id, GalleryComment.status == "approved")
+        .order_by(GalleryComment.created_at.asc())
+        .all()
+    )
+    return {
+        "id": post.id,
+        "content": post.content,
+        "author": author_display_name(post.user),
+        "created_at": post.created_at,
+        "is_mine": post.user_id == current_user.id,
+        "comments": [
+            {"id": c.id, "content": c.content, "author": author_display_name(c.user), "created_at": c.created_at}
+            for c in comments
+        ],
+    }
+
+
+@app.post("/api/gallery/{post_id}/comments")
+async def gallery_add_comment(
+    post_id: int,
+    req: GalleryCommentRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Добавляет комментарий к посту — тоже проходит модерацию перед публикацией."""
+    post = db.query(GalleryPost).filter(GalleryPost.id == post_id, GalleryPost.status == "approved").first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Пост не найден")
+
+    allowed, reason = ai_service.moderate_text(req.content)
+    comment = GalleryComment(
+        post_id=post_id,
+        user_id=current_user.id,
+        content=req.content,
+        status="approved" if allowed else "rejected",
+        reject_reason=None if allowed else reason,
+    )
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    return {"id": comment.id, "status": comment.status, "reject_reason": comment.reject_reason}
+
+
+@app.delete("/api/gallery/{post_id}")
+async def gallery_delete(
+    post_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Удаляет свой пост из галереи."""
+    post = db.query(GalleryPost).filter(GalleryPost.id == post_id, GalleryPost.user_id == current_user.id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Пост не найден")
+    db.delete(post)
+    db.commit()
+    return {"status": "deleted"}
+
+
 # ==================== Эндпоинты для бота (требуют секрет BOT_INTERNAL_SECRET) ====================
 
 @app.post("/api/bot/message", dependencies=[Depends(verify_bot_secret)])
@@ -710,3 +876,96 @@ async def bot_delete_favorite(req: BotFavoriteDeleteRequest, db: Session = Depen
     db.delete(favorite)
     db.commit()
     return {"status": "deleted"}
+
+
+# ==================== Галерея промптов для бота ====================
+
+@app.post("/api/bot/gallery/publish", dependencies=[Depends(verify_bot_secret)])
+async def bot_gallery_publish(req: BotGalleryPublishRequest, db: Session = Depends(get_db)):
+    """Бот вызывает это, когда пользователь публикует промпт из своего избранного в галерею."""
+    user = get_or_create_bot_user(db, req.telegram_id, req.telegram_username, req.telegram_first_name)
+
+    allowed, reason = ai_service.moderate_text(req.content)
+    post = GalleryPost(
+        user_id=user.id,
+        content=req.content,
+        status="approved" if allowed else "rejected",
+        reject_reason=None if allowed else reason,
+    )
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return {"id": post.id, "status": post.status, "reject_reason": post.reject_reason}
+
+
+@app.get("/api/bot/gallery", dependencies=[Depends(verify_bot_secret)])
+async def bot_gallery_list(limit: int = 10, db: Session = Depends(get_db)):
+    """Список последних опубликованных промптов — для показа в боте."""
+    posts = (
+        db.query(GalleryPost)
+        .filter(GalleryPost.status == "approved")
+        .order_by(GalleryPost.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    result = []
+    for p in posts:
+        comment_count = (
+            db.query(GalleryComment)
+            .filter(GalleryComment.post_id == p.id, GalleryComment.status == "approved")
+            .count()
+        )
+        result.append(
+            {
+                "id": p.id,
+                "content": p.content,
+                "author": author_display_name(p.user),
+                "comment_count": comment_count,
+            }
+        )
+    return {"posts": result}
+
+
+@app.get("/api/bot/gallery/{post_id}", dependencies=[Depends(verify_bot_secret)])
+async def bot_gallery_detail(post_id: int, db: Session = Depends(get_db)):
+    """Один пост галереи с комментариями — для показа в боте."""
+    post = db.query(GalleryPost).filter(GalleryPost.id == post_id, GalleryPost.status == "approved").first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Пост не найден")
+
+    comments = (
+        db.query(GalleryComment)
+        .filter(GalleryComment.post_id == post_id, GalleryComment.status == "approved")
+        .order_by(GalleryComment.created_at.asc())
+        .limit(15)
+        .all()
+    )
+    return {
+        "id": post.id,
+        "content": post.content,
+        "author": author_display_name(post.user),
+        "comments": [{"author": author_display_name(c.user), "content": c.content} for c in comments],
+    }
+
+
+@app.post("/api/bot/gallery/comment", dependencies=[Depends(verify_bot_secret)])
+async def bot_gallery_comment(req: BotGalleryCommentRequest, db: Session = Depends(get_db)):
+    """Бот вызывает это, когда пользователь присылает текст комментария к посту галереи."""
+    user = get_or_create_bot_user(db, req.telegram_id, req.telegram_username, req.telegram_first_name)
+
+    post = db.query(GalleryPost).filter(GalleryPost.id == req.post_id, GalleryPost.status == "approved").first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Пост не найден")
+
+    allowed, reason = ai_service.moderate_text(req.content)
+    comment = GalleryComment(
+        post_id=req.post_id,
+        user_id=user.id,
+        content=req.content,
+        status="approved" if allowed else "rejected",
+        reject_reason=None if allowed else reason,
+    )
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    return {"status": comment.status, "reject_reason": comment.reject_reason}
