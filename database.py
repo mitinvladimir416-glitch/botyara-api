@@ -76,6 +76,37 @@ class Message(Base):
     user = relationship("User", back_populates="messages")
 
 
+class GalleryPost(Base):
+    """Опубликованный в галерее промпт (можно опубликовать только то, что уже в Избранном)."""
+    __tablename__ = "gallery_posts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    content = Column(Text, nullable=False)
+    status = Column(String, nullable=False, server_default="pending")  # pending/approved/rejected
+    reject_reason = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+    comments = relationship("GalleryComment", back_populates="post", cascade="all, delete-orphan")
+
+
+class GalleryComment(Base):
+    """Комментарий к посту в галерее — тоже проходит модерацию перед публикацией."""
+    __tablename__ = "gallery_comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("gallery_posts.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    content = Column(Text, nullable=False)
+    status = Column(String, nullable=False, server_default="pending")
+    reject_reason = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    post = relationship("GalleryPost", back_populates="comments")
+    user = relationship("User")
+
+
 def init_db():
     """Создаёт таблицы, если их ещё нет. Вызывается один раз при старте приложения.
     ВАЖНО: create_all создаёт только отсутствующие ТАБЛИЦЫ целиком, но не добавляет
