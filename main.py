@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 import ai_service
 import auth
-from database import get_db, init_db, User, Favorite, Message, GalleryPost, GalleryComment
+from database import get_db, init_db, User, Favorite, Message, GalleryPost, GalleryComment, PublicChatMessage
 
 logging.basicConfig(level=logging.INFO)
 
@@ -164,6 +164,17 @@ class BotGalleryCommentRequest(BaseModel):
     content: str
 
 
+class PublicChatRequest(BaseModel):
+    content: str
+
+
+class BotPublicChatRequest(BaseModel):
+    telegram_id: int
+    telegram_username: str | None = None
+    telegram_first_name: str | None = None
+    content: str
+
+
 # ==================== Авторизация: вспомогательное ====================
 
 security = HTTPBearer(auto_error=False)
@@ -232,7 +243,9 @@ def get_or_create_bot_user(
 
 
 def author_display_name(user: User) -> str:
-    """Имя автора для показа в галерее — Telegram-имя, иначе часть email, иначе 'Аноним'."""
+    """Имя автора для показа в галерее/чате — заданное имя, иначе Telegram-имя, иначе email, иначе 'Аноним'."""
+    if user.display_name:
+        return user.display_name
     if user.telegram_first_name:
         return user.telegram_first_name
     if user.email:
@@ -525,7 +538,33 @@ async def get_me(current_user: User = Depends(get_current_user)):
         "email": current_user.email,
         "telegram_username": current_user.telegram_username,
         "telegram_first_name": current_user.telegram_first_name,
+        "display_name": current_user.display_name,
+        "avatar_base64": current_user.avatar_base64,
     }
+
+
+@app.post("/api/me/profile")
+async def update_profile(
+    display_name: str = Form(""),
+    avatar: UploadFile | None = File(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Сохраняет имя и/или фото профиля. Оба поля необязательны — можно менять по отдельности."""
+    if display_name.strip():
+        current_user.display_name = display_name.strip()[:50]
+
+    if avatar is not None:
+        avatar_bytes = await avatar.read()
+        if len(avatar_bytes) > 1_500_000:
+            raise HTTPException(status_code=400, detail="Фото слишком большое (максимум ~1.5 МБ)")
+        b64 = base64.b64encode(avatar_bytes).decode("utf-8")
+        content_type = avatar.content_type or "image/jpeg"
+        current_user.avatar_base64 = f"data:{content_type};base64,{b64}"
+
+    db.commit()
+    db.refresh(current_user)
+    return {"display_name": current_user.display_name, "avatar_base64": current_user.avatar_base64}
 
 
 @app.post("/api/me/link-email")
@@ -711,6 +750,7 @@ async def gallery_list(
                 "id": p.id,
                 "content": p.content,
                 "author": author_display_name(p.user),
+                "author_avatar": p.user.avatar_base64,
                 "created_at": p.created_at,
                 "comment_count": comment_count,
                 "is_mine": p.user_id == current_user.id,
@@ -740,10 +780,17 @@ async def gallery_detail(
         "id": post.id,
         "content": post.content,
         "author": author_display_name(post.user),
+        "author_avatar": post.user.avatar_base64,
         "created_at": post.created_at,
         "is_mine": post.user_id == current_user.id,
         "comments": [
-            {"id": c.id, "content": c.content, "author": author_display_name(c.user), "created_at": c.created_at}
+            {
+                "id": c.id,
+                "content": c.content,
+                "author": author_display_name(c.user),
+                "author_avatar": c.user.avatar_base64,
+                "created_at": c.created_at,
+            }
             for c in comments
         ],
     }
@@ -788,6 +835,55 @@ async def gallery_delete(
     db.delete(post)
     db.commit()
     return {"status": "deleted"}
+
+
+# ==================== Общий публичный чат (требует авторизации сайта) ====================
+
+@app.get("/api/public-chat")
+async def public_chat_list(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Последние 50 одобренных сообщений общего чата, от старых к новым."""
+    messages = (
+        db.query(PublicChatMessage)
+        .filter(PublicChatMessage.status == "approved")
+        .order_by(PublicChatMessage.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    messages.reverse()
+    return [
+        {
+            "id": m.id,
+            "content": m.content,
+            "author": author_display_name(m.user),
+            "author_avatar": m.user.avatar_base64,
+            "created_at": m.created_at,
+            "is_mine": m.user_id == current_user.id,
+        }
+        for m in messages
+    ]
+
+
+@app.post("/api/public-chat")
+async def public_chat_send(
+    req: PublicChatRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Отправляет сообщение в общий чат — проходит модерацию перед показом всем."""
+    allowed, reason = ai_service.moderate_text(req.content)
+    message = PublicChatMessage(
+        user_id=current_user.id,
+        content=req.content,
+        status="approved" if allowed else "rejected",
+        reject_reason=None if allowed else reason,
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+    return {"id": message.id, "status": message.status, "reject_reason": message.reject_reason}
 
 
 # ==================== Эндпоинты для бота (требуют секрет BOT_INTERNAL_SECRET) ====================
@@ -969,3 +1065,41 @@ async def bot_gallery_comment(req: BotGalleryCommentRequest, db: Session = Depen
     db.commit()
     db.refresh(comment)
     return {"status": comment.status, "reject_reason": comment.reject_reason}
+
+
+# ==================== Общий публичный чат для бота ====================
+
+@app.get("/api/bot/public-chat", dependencies=[Depends(verify_bot_secret)])
+async def bot_public_chat_list(limit: int = 15, db: Session = Depends(get_db)):
+    """Последние сообщения общего чата — для показа в боте."""
+    messages = (
+        db.query(PublicChatMessage)
+        .filter(PublicChatMessage.status == "approved")
+        .order_by(PublicChatMessage.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    messages.reverse()
+    return {
+        "messages": [
+            {"author": author_display_name(m.user), "content": m.content} for m in messages
+        ]
+    }
+
+
+@app.post("/api/bot/public-chat", dependencies=[Depends(verify_bot_secret)])
+async def bot_public_chat_send(req: BotPublicChatRequest, db: Session = Depends(get_db)):
+    """Бот вызывает это, когда пользователь пишет сообщение в общий чат."""
+    user = get_or_create_bot_user(db, req.telegram_id, req.telegram_username, req.telegram_first_name)
+
+    allowed, reason = ai_service.moderate_text(req.content)
+    message = PublicChatMessage(
+        user_id=user.id,
+        content=req.content,
+        status="approved" if allowed else "rejected",
+        reject_reason=None if allowed else reason,
+    )
+    db.add(message)
+    db.commit()
+    db.refresh(message)
+    return {"status": message.status, "reject_reason": message.reject_reason}
