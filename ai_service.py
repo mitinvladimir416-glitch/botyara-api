@@ -11,6 +11,7 @@ import os
 import re
 
 from groq import Groq, APIConnectionError, APIStatusError, RateLimitError
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -19,10 +20,47 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise ValueError("Не найден GROQ_API_KEY — проверь переменные окружения")
 
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")  # необязательный — DeepSeek через OpenRouter
+
 MODEL = "openai/gpt-oss-120b"
 VISION_MODEL = "qwen/qwen3.6-27b"
+DEEPSEEK_MODEL = "deepseek/deepseek-v4-flash"  # основная модель для обычного чата, если ключ задан
 
 groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0)
+
+openrouter_client = (
+    OpenAI(api_key=OPENROUTER_API_KEY, base_url="https://openrouter.ai/api/v1", max_retries=0)
+    if OPENROUTER_API_KEY
+    else None
+)
+
+
+def chat_completion_with_fallback(messages: list[dict], temperature: float = 0.85, max_tokens: int = 1024):
+    """
+    Пробует ответить через DeepSeek Flash (OpenRouter) — он дешевле и часто качественнее для
+    обычного текстового общения. Если ключ не задан или запрос не удался — прозрачно
+    откатывается на Groq, чтобы бот/сайт не переставали работать.
+    Возвращает текст ответа (уже без обработки clean_reply).
+    """
+    if openrouter_client is not None:
+        try:
+            response = openrouter_client.chat.completions.create(
+                model=DEEPSEEK_MODEL,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return response.choices[0].message.content
+        except Exception:
+            logging.exception("DeepSeek (OpenRouter) недоступен, переключаюсь на Groq")
+
+    response = groq_client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return response.choices[0].message.content
 
 SYSTEM_PROMPT = "Ты дружелюбный ассистент, отвечай кратко и по делу на русском языке."
 
@@ -152,15 +190,9 @@ def get_chat_reply(history: list[dict], role: str | None = None) -> str:
 
     messages = [{"role": "system", "content": system_prompt}] + history[-20:]
     try:
-        response = groq_client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            temperature=0.85,
-            max_tokens=1024,
-        )
-        return clean_reply(response.choices[0].message.content)
+        return clean_reply(chat_completion_with_fallback(messages, temperature=0.85, max_tokens=1024))
     except Exception as e:
-        logging.exception("Ошибка при обращении к Groq API (chat)")
+        logging.exception("Ошибка при обращении к AI (chat)")
         return describe_groq_error(e)
 
 
