@@ -236,6 +236,10 @@ PROMPT_CONFIG = {
             "Ты — эксперт по составлению промптов для генерации видео через нейросети "
             "(Sora, Runway, Kling, Veo, Pika и подобные). Твоя задача — помочь пользователю "
             "составить качественный промпт. Веди диалог по существу:\n"
+            "0. Если пользователь ещё не присылал изображения кадров, в самом начале обязательно "
+            "спроси: есть ли у него референсные кадры — первый и/или последний кадр сцены "
+            "(можно прислать картинками, это очень поможет с деталями). Если кадров нет — "
+            "предложи просто описать сцену словами и продолжай без них.\n"
             "1. Уточни сюжет сцены, движение камеры (панорама, наезд, статика и т.д.), стиль "
             "(кино, реализм, анимация), освещение, длительность, темп действия, звук/музыку если поддерживается.\n"
             "Задавай не больше 1-2 уточняющих вопросов за раз.\n"
@@ -276,6 +280,56 @@ def get_prompt_reply(topic: str, target: str | None, history: list[dict]) -> str
         return clean_reply(response.choices[0].message.content)
     except Exception as e:
         logging.exception("Ошибка при составлении промпта")
+        return describe_groq_error(e)
+
+
+def get_video_prompt_from_frames(
+    target: str | None,
+    description: str,
+    first_frame_b64: str | None,
+    last_frame_b64: str | None,
+    history: list[dict],
+) -> str:
+    """Составляет промпт для видео по присланным кадрам (первому и/или последнему) и описанию словами."""
+    config = PROMPT_CONFIG["video"]
+    target_note = (
+        f"Пользователь уже выбрал нейросеть: {target}. Готовый промпт формируй именно под неё, "
+        "не спрашивай про это повторно. "
+        if target
+        else ""
+    )
+
+    combined_system = (
+        config["system_prompt"]
+        + "\n\nПользователь прислал референсные кадры сцены (первый и/или последний кадр видео). "
+        + target_note
+        + "Учти визуальные детали кадров (композицию, освещение, цвета, персонажей) при составлении "
+        "промпта. Сразу выдай готовый промпт с пометкой 'ГОТОВЫЙ ПРОМПТ:'."
+    )
+
+    content = [{"type": "text", "text": description or "Опиши сцену по присланным кадрам."}]
+    if first_frame_b64:
+        content.append({"type": "text", "text": "Это первый кадр сцены:"})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{first_frame_b64}"}})
+    if last_frame_b64:
+        content.append({"type": "text", "text": "Это последний кадр сцены:"})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{last_frame_b64}"}})
+
+    messages = [{"role": "system", "content": combined_system}] + history[-10:] + [
+        {"role": "user", "content": content}
+    ]
+
+    try:
+        response = groq_client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=2048,
+            reasoning_format="hidden",
+        )
+        return clean_reply(response.choices[0].message.content)
+    except Exception as e:
+        logging.exception("Ошибка при составлении промпта по кадрам видео")
         return describe_groq_error(e)
 
 
