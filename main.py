@@ -13,6 +13,7 @@ API-сервер для сайта botyara.ru.
 import base64
 import logging
 import os
+import tempfile
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -347,6 +348,53 @@ async def prompt_image_from_photo(
     reply = ai_service.get_image_prompt_from_photo(photo_base64, desired_change, history=[])
     is_final = "ГОТОВЫЙ ПРОМПТ:" in reply
     return {"reply": reply, "is_final": is_final}
+
+
+@app.post("/api/prompt/video-frames")
+async def prompt_video_frames(
+    target: str = Form(""),
+    description: str = Form(""),
+    first_frame: UploadFile | None = File(None),
+    last_frame: UploadFile | None = File(None),
+):
+    """Составление видео-промпта по первому/последнему кадру (раздел Промпты → Видео)."""
+    first_b64 = None
+    last_b64 = None
+    if first_frame is not None:
+        first_b64 = base64.b64encode(await first_frame.read()).decode("utf-8")
+    if last_frame is not None:
+        last_b64 = base64.b64encode(await last_frame.read()).decode("utf-8")
+
+    reply = ai_service.get_video_prompt_from_frames(
+        target or None, description, first_b64, last_b64, history=[]
+    )
+    is_final = "ГОТОВЫЙ ПРОМПТ:" in reply
+    return {"reply": reply, "is_final": is_final}
+
+
+@app.post("/api/voice-transcribe")
+async def voice_transcribe(
+    audio: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Распознаёт голосовое сообщение с сайта в текст (раздел Общение)."""
+    suffix = os.path.splitext(audio.filename or "audio.webm")[1] or ".webm"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await audio.read())
+        tmp_path = tmp.name
+
+    try:
+        text = ai_service.transcribe_audio(tmp_path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    if not text:
+        raise HTTPException(status_code=422, detail="Не удалось распознать голосовое сообщение")
+
+    return {"text": text}
 
 
 @app.get("/api/cover/formats")
