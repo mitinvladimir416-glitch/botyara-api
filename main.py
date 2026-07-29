@@ -43,6 +43,14 @@ app = FastAPI(title="Botyara API", version="0.2.0")
 # а не от кого попало. Должен совпадать со значением BOT_INTERNAL_SECRET в Railway (у бота).
 BOT_INTERNAL_SECRET = os.getenv("BOT_INTERNAL_SECRET")
 
+# Telegram ID администратора сайта — тот же человек, что ADMIN_ID у бота. Аккаунт с таким
+# telegram_id получает права модератора (может чистить общий чат/галерею).
+ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
+
+
+def is_site_admin(user: User) -> bool:
+    return bool(ADMIN_TELEGRAM_ID) and user.telegram_id == ADMIN_TELEGRAM_ID
+
 
 @app.on_event("startup")
 def on_startup():
@@ -170,6 +178,7 @@ class BotGalleryPublishRequest(BaseModel):
     telegram_username: str | None = None
     telegram_first_name: str | None = None
     content: str
+    category: str = "other"
 
 
 class BotGalleryCommentRequest(BaseModel):
@@ -556,6 +565,7 @@ async def get_me(current_user: User = Depends(get_current_user)):
         "telegram_first_name": current_user.telegram_first_name,
         "display_name": current_user.display_name,
         "avatar_base64": current_user.avatar_base64,
+        "is_admin": is_site_admin(current_user),
     }
 
 
@@ -850,11 +860,33 @@ async def gallery_delete(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Удаляет свой пост из галереи."""
-    post = db.query(GalleryPost).filter(GalleryPost.id == post_id, GalleryPost.user_id == current_user.id).first()
+    """Удаляет пост из галереи — свой, либо любой, если ты администратор."""
+    query = db.query(GalleryPost).filter(GalleryPost.id == post_id)
+    if not is_site_admin(current_user):
+        query = query.filter(GalleryPost.user_id == current_user.id)
+    post = query.first()
     if not post:
         raise HTTPException(status_code=404, detail="Пост не найден")
     db.delete(post)
+    db.commit()
+    return {"status": "deleted"}
+
+
+@app.delete("/api/gallery/{post_id}/comments/{comment_id}")
+async def gallery_delete_comment(
+    post_id: int,
+    comment_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Удаляет комментарий — свой, либо любой, если ты администратор."""
+    query = db.query(GalleryComment).filter(GalleryComment.id == comment_id, GalleryComment.post_id == post_id)
+    if not is_site_admin(current_user):
+        query = query.filter(GalleryComment.user_id == current_user.id)
+    comment = query.first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="Комментарий не найден")
+    db.delete(comment)
     db.commit()
     return {"status": "deleted"}
 
@@ -928,6 +960,36 @@ async def public_chat_send(
     db.commit()
     db.refresh(message)
     return {"id": message.id, "status": message.status, "reject_reason": message.reject_reason}
+
+
+@app.delete("/api/public-chat/{message_id}")
+async def public_chat_delete(
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Удаляет сообщение из общего чата — доступно автору сообщения или администратору."""
+    message = db.query(PublicChatMessage).filter(PublicChatMessage.id == message_id).first()
+    if not message:
+        raise HTTPException(status_code=404, detail="Сообщение не найдено")
+    if message.user_id != current_user.id and not is_site_admin(current_user):
+        raise HTTPException(status_code=403, detail="Удалить можно только своё сообщение")
+    db.delete(message)
+    db.commit()
+    return {"status": "deleted"}
+
+
+@app.delete("/api/public-chat")
+async def public_chat_clear(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Полностью очищает общий чат — только для администратора."""
+    if not is_site_admin(current_user):
+        raise HTTPException(status_code=403, detail="Только администратор может очистить общий чат")
+    db.query(PublicChatMessage).delete()
+    db.commit()
+    return {"status": "cleared"}
 
 
 # ==================== Эндпоинты для бота (требуют секрет BOT_INTERNAL_SECRET) ====================
@@ -1029,6 +1091,7 @@ async def bot_gallery_publish(req: BotGalleryPublishRequest, db: Session = Depen
     post = GalleryPost(
         user_id=user.id,
         content=req.content,
+        category=req.category or "other",
         status="approved" if allowed else "rejected",
         reject_reason=None if allowed else reason,
     )
@@ -1059,6 +1122,7 @@ async def bot_gallery_list(limit: int = 10, db: Session = Depends(get_db)):
             {
                 "id": p.id,
                 "content": p.content,
+                "category": p.category,
                 "author": author_display_name(p.user),
                 "comment_count": comment_count,
             }
@@ -1083,6 +1147,7 @@ async def bot_gallery_detail(post_id: int, db: Session = Depends(get_db)):
     return {
         "id": post.id,
         "content": post.content,
+        "category": post.category,
         "author": author_display_name(post.user),
         "comments": [{"author": author_display_name(c.user), "content": c.content} for c in comments],
     }
