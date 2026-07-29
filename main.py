@@ -125,6 +125,7 @@ class BotMessageRequest(BaseModel):
     telegram_first_name: str | None = None
     role: str  # "user" или "assistant"
     content: str
+    persona: str | None = None  # какая роль/вкладка общения — "default" или id роли
 
 
 class BotFavoriteRequest(BaseModel):
@@ -585,7 +586,9 @@ async def bot_save_message(req: BotMessageRequest, db: Session = Depends(get_db)
     """
     user = get_or_create_bot_user(db, req.telegram_id, req.telegram_username, req.telegram_first_name)
 
-    message = Message(user_id=user.id, role=req.role, content=req.content, source="bot", persona="default")
+    message = Message(
+        user_id=user.id, role=req.role, content=req.content, source="bot", persona=req.persona or "default"
+    )
     db.add(message)
     db.commit()
 
