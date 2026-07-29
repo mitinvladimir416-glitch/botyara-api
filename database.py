@@ -58,6 +58,8 @@ class Favorite(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     content = Column(Text, nullable=False)
+    # category — папка: "suno" / "image" / "video" / "cover" / "other"
+    category = Column(String, nullable=False, server_default="other")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User", back_populates="favorites")
@@ -87,6 +89,7 @@ class GalleryPost(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     content = Column(Text, nullable=False)
+    category = Column(String, nullable=False, server_default="other")
     status = Column(String, nullable=False, server_default="pending")  # pending/approved/rejected
     reject_reason = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -123,6 +126,15 @@ class PublicChatMessage(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User")
+
+
+class Announcement(Base):
+    """Оповещение об обновлении — публикуется ботом (/announce), показывается в ленте на сайте."""
+    __tablename__ = "announcements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 def init_db():
