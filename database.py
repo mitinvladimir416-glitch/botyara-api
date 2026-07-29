@@ -42,6 +42,10 @@ class User(Base):
     telegram_username = Column(String, nullable=True)
     telegram_first_name = Column(String, nullable=True)
 
+    # Профиль (заполняется пользователем вручную в разделе "Аккаунт")
+    display_name = Column(String, nullable=True)
+    avatar_base64 = Column(Text, nullable=True)  # data URL целиком: "data:image/jpeg;base64,..."
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     favorites = relationship("Favorite", back_populates="user", cascade="all, delete-orphan")
@@ -104,6 +108,20 @@ class GalleryComment(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     post = relationship("GalleryPost", back_populates="comments")
+    user = relationship("User")
+
+
+class PublicChatMessage(Base):
+    """Сообщение в общем публичном чате — видно всем вошедшим пользователям, проходит модерацию."""
+    __tablename__ = "public_chat_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    content = Column(Text, nullable=False)
+    status = Column(String, nullable=False, server_default="pending")  # pending/approved/rejected
+    reject_reason = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
     user = relationship("User")
 
 
