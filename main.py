@@ -23,7 +23,17 @@ from sqlalchemy.orm import Session
 
 import ai_service
 import auth
-from database import get_db, init_db, User, Favorite, Message, GalleryPost, GalleryComment, PublicChatMessage
+from database import (
+    get_db,
+    init_db,
+    User,
+    Favorite,
+    Message,
+    GalleryPost,
+    GalleryComment,
+    PublicChatMessage,
+    Announcement,
+)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -103,6 +113,11 @@ class TelegramAuthRequest(BaseModel):
 
 class FavoriteCreateRequest(BaseModel):
     content: str
+    category: str = "other"  # "suno" / "image" / "video" / "cover" / "other"
+
+
+class BotAnnouncementRequest(BaseModel):
+    content: str
 
 
 class LinkEmailRequest(BaseModel):
@@ -134,6 +149,7 @@ class BotFavoriteRequest(BaseModel):
     telegram_username: str | None = None
     telegram_first_name: str | None = None
     content: str
+    category: str = "other"
 
 
 class BotFavoriteDeleteRequest(BaseModel):
@@ -625,7 +641,10 @@ async def list_favorites(
         .order_by(Favorite.created_at.desc())
         .all()
     )
-    return [{"id": f.id, "content": f.content, "created_at": f.created_at} for f in favorites]
+    return [
+        {"id": f.id, "content": f.content, "category": f.category, "created_at": f.created_at}
+        for f in favorites
+    ]
 
 
 @app.post("/api/favorites")
@@ -635,11 +654,11 @@ async def add_favorite(
     db: Session = Depends(get_db),
 ):
     """Сохраняет промпт в избранное текущего пользователя."""
-    favorite = Favorite(user_id=current_user.id, content=req.content)
+    favorite = Favorite(user_id=current_user.id, content=req.content, category=req.category or "other")
     db.add(favorite)
     db.commit()
     db.refresh(favorite)
-    return {"id": favorite.id, "content": favorite.content, "created_at": favorite.created_at}
+    return {"id": favorite.id, "content": favorite.content, "category": favorite.category, "created_at": favorite.created_at}
 
 
 @app.patch("/api/favorites/{favorite_id}")
@@ -716,6 +735,7 @@ async def gallery_publish(
     post = GalleryPost(
         user_id=current_user.id,
         content=favorite.content,
+        category=favorite.category,
         status="approved" if allowed else "rejected",
         reject_reason=None if allowed else reason,
     )
@@ -749,6 +769,7 @@ async def gallery_list(
             {
                 "id": p.id,
                 "content": p.content,
+                "category": p.category,
                 "author": author_display_name(p.user),
                 "author_avatar": p.user.avatar_base64,
                 "created_at": p.created_at,
@@ -779,6 +800,7 @@ async def gallery_detail(
     return {
         "id": post.id,
         "content": post.content,
+        "category": post.category,
         "author": author_display_name(post.user),
         "author_avatar": post.user.avatar_base64,
         "created_at": post.created_at,
@@ -835,6 +857,28 @@ async def gallery_delete(
     db.delete(post)
     db.commit()
     return {"status": "deleted"}
+
+
+# ==================== Лента оповещений об обновлениях ====================
+
+@app.get("/api/announcements")
+async def list_announcements(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Последние оповещения об обновлениях — публикует администратор через /announce в боте."""
+    items = db.query(Announcement).order_by(Announcement.created_at.desc()).limit(20).all()
+    return [{"id": a.id, "content": a.content, "created_at": a.created_at} for a in items]
+
+
+@app.post("/api/bot/announcements", dependencies=[Depends(verify_bot_secret)])
+async def bot_save_announcement(req: BotAnnouncementRequest, db: Session = Depends(get_db)):
+    """Бот вызывает это после рассылки /announce — чтобы то же оповещение появилось на сайте."""
+    item = Announcement(content=req.content)
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {"id": item.id}
 
 
 # ==================== Общий публичный чат (требует авторизации сайта) ====================
@@ -929,12 +973,12 @@ async def bot_add_favorite(req: BotFavoriteRequest, db: Session = Depends(get_db
     """Бот вызывает это, когда пользователь жмёт '⭐ Сохранить в избранное' — сохраняет в общую БД."""
     user = get_or_create_bot_user(db, req.telegram_id, req.telegram_username, req.telegram_first_name)
 
-    favorite = Favorite(user_id=user.id, content=req.content)
+    favorite = Favorite(user_id=user.id, content=req.content, category=req.category or "other")
     db.add(favorite)
     db.commit()
     db.refresh(favorite)
 
-    return {"id": favorite.id, "content": favorite.content, "created_at": favorite.created_at}
+    return {"id": favorite.id, "content": favorite.content, "category": favorite.category, "created_at": favorite.created_at}
 
 
 @app.get("/api/bot/favorites/{telegram_id}", dependencies=[Depends(verify_bot_secret)])
@@ -951,7 +995,7 @@ async def bot_list_favorites(telegram_id: int, db: Session = Depends(get_db)):
         .order_by(Favorite.created_at.desc())
         .all()
     )
-    return {"favorites": [{"id": f.id, "content": f.content} for f in favorites]}
+    return {"favorites": [{"id": f.id, "content": f.content, "category": f.category} for f in favorites]}
 
 
 @app.post("/api/bot/favorite/delete", dependencies=[Depends(verify_bot_secret)])
