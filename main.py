@@ -12,8 +12,10 @@ API-сервер для сайта botyara.ru.
 
 import base64
 import logging
+import math
 import os
 import tempfile
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +35,9 @@ from database import (
     GalleryComment,
     PublicChatMessage,
     Announcement,
+    GalleryLike,
+    Notification,
+    UserAchievement,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -50,6 +55,86 @@ ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
 
 def is_site_admin(user: User) -> bool:
     return bool(ADMIN_TELEGRAM_ID) and user.telegram_id == ADMIN_TELEGRAM_ID
+
+
+# ==================== Геймификация: уровни, опыт, стрик, достижения ====================
+
+LEVEL_TITLES = [
+    (1, 4, "🌱 Новичок квартала"),
+    (5, 9, "😎 Свой в доску"),
+    (10, 19, "🔥 Мастер вайба"),
+    (20, 34, "👑 Легенда района"),
+    (35, 9999, "💎 Ботяра №1"),
+]
+
+ACHIEVEMENTS = {
+    "first_post": {"label": "🎨 Первый пост", "desc": "Опубликовал первый промпт в галерее"},
+    "hundred_prompts": {"label": "💯 Сотня", "desc": "Сохранил 100 промптов в избранное"},
+    "soul_of_party": {"label": "🎉 Душа компании", "desc": "Оставил 10 комментариев в галерее"},
+    "streak_7": {"label": "🔥 Неделя подряд", "desc": "7 дней подряд на сайте"},
+    "streak_30": {"label": "🏆 Месяц подряд", "desc": "30 дней подряд на сайте"},
+    "liked_10": {"label": "❤️ Народная любовь", "desc": "Твои посты в сумме набрали 10 лайков"},
+}
+
+
+def calc_level(xp: int) -> int:
+    """Уровень растёт по нарастающей — каждый следующий требует больше опыта."""
+    return int(math.sqrt(max(xp, 0) / 20)) + 1
+
+
+def xp_for_next_level(level: int) -> int:
+    """Сколько всего XP нужно, чтобы достичь следующего уровня."""
+    return 20 * level * level
+
+
+def level_title(level: int) -> str:
+    for lo, hi, title in LEVEL_TITLES:
+        if lo <= level <= hi:
+            return title
+    return LEVEL_TITLES[-1][2]
+
+
+def add_xp(db: Session, user: User, amount: int):
+    user.xp = (user.xp or 0) + amount
+    db.commit()
+
+
+def notify(db: Session, user: User, content: str):
+    db.add(Notification(user_id=user.id, content=content))
+    db.commit()
+
+
+def grant_achievement(db: Session, user: User, key: str):
+    """Выдаёт достижение, если его ещё не было. Возвращает True, если выдано впервые."""
+    exists = (
+        db.query(UserAchievement)
+        .filter(UserAchievement.user_id == user.id, UserAchievement.key == key)
+        .first()
+    )
+    if exists:
+        return False
+    db.add(UserAchievement(user_id=user.id, key=key))
+    db.commit()
+    notify(db, user, f"🏅 Новое достижение: {ACHIEVEMENTS[key]['label']} — {ACHIEVEMENTS[key]['desc']}")
+    return True
+
+
+def update_streak(db: Session, user: User):
+    """Обновляет серию дней подряд — вызывается при каждом /api/me (то есть при каждом заходе)."""
+    today = date.today()
+    if user.last_active_date == today:
+        return
+    if user.last_active_date == today - timedelta(days=1):
+        user.current_streak = (user.current_streak or 0) + 1
+    else:
+        user.current_streak = 1
+    user.last_active_date = today
+    db.commit()
+
+    if user.current_streak == 7:
+        grant_achievement(db, user, "streak_7")
+    elif user.current_streak == 30:
+        grant_achievement(db, user, "streak_30")
 
 
 @app.on_event("startup")
@@ -224,7 +309,19 @@ def get_current_user(
     if user is None:
         raise HTTPException(status_code=401, detail="Пользователь не найден")
 
+    now = datetime.now(timezone.utc)
+    if not user.last_seen_at or (now - user.last_seen_at).total_seconds() > 60:
+        user.last_seen_at = now
+        db.commit()
+
     return user
+
+
+def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    """Зависимость FastAPI: пускает только администратора сайта (см. is_site_admin)."""
+    if not is_site_admin(current_user):
+        raise HTTPException(status_code=403, detail="Доступно только администратору")
+    return current_user
 
 
 def verify_bot_secret(x_bot_secret: str | None = Header(default=None)):
@@ -312,6 +409,8 @@ async def chat(
         Message(user_id=current_user.id, role="assistant", content=reply, source="web", persona=persona)
     )
     db.commit()
+
+    add_xp(db, current_user, 1)
 
     return {"reply": reply}
 
@@ -556,8 +655,10 @@ async def telegram_login(req: TelegramAuthRequest, db: Session = Depends(get_db)
 
 
 @app.get("/api/me")
-async def get_me(current_user: User = Depends(get_current_user)):
+async def get_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Возвращает данные текущего залогиненного пользователя (проверка, что токен рабочий)."""
+    update_streak(db, current_user)
+    level = calc_level(current_user.xp or 0)
     return {
         "id": current_user.id,
         "email": current_user.email,
@@ -566,6 +667,11 @@ async def get_me(current_user: User = Depends(get_current_user)):
         "display_name": current_user.display_name,
         "avatar_base64": current_user.avatar_base64,
         "is_admin": is_site_admin(current_user),
+        "xp": current_user.xp or 0,
+        "level": level,
+        "level_title": level_title(level),
+        "xp_for_next_level": xp_for_next_level(level),
+        "current_streak": current_user.current_streak or 0,
     }
 
 
@@ -668,6 +774,12 @@ async def add_favorite(
     db.add(favorite)
     db.commit()
     db.refresh(favorite)
+
+    add_xp(db, current_user, 5)
+    total_favorites = db.query(Favorite).filter(Favorite.user_id == current_user.id).count()
+    if total_favorites >= 100:
+        grant_achievement(db, current_user, "hundred_prompts")
+
     return {"id": favorite.id, "content": favorite.content, "category": favorite.category, "created_at": favorite.created_at}
 
 
@@ -752,6 +864,13 @@ async def gallery_publish(
     db.add(post)
     db.commit()
     db.refresh(post)
+
+    if allowed:
+        add_xp(db, current_user, 15)
+        total_posts = db.query(GalleryPost).filter(GalleryPost.user_id == current_user.id).count()
+        if total_posts == 1:
+            grant_achievement(db, current_user, "first_post")
+
     return {"id": post.id, "status": post.status, "reject_reason": post.reject_reason}
 
 
@@ -775,6 +894,13 @@ async def gallery_list(
             .filter(GalleryComment.post_id == p.id, GalleryComment.status == "approved")
             .count()
         )
+        like_count = db.query(GalleryLike).filter(GalleryLike.post_id == p.id).count()
+        liked_by_me = (
+            db.query(GalleryLike)
+            .filter(GalleryLike.post_id == p.id, GalleryLike.user_id == current_user.id)
+            .first()
+            is not None
+        )
         result.append(
             {
                 "id": p.id,
@@ -782,8 +908,11 @@ async def gallery_list(
                 "category": p.category,
                 "author": author_display_name(p.user),
                 "author_avatar": p.user.avatar_base64,
+                "author_level": calc_level(p.user.xp or 0),
                 "created_at": p.created_at,
                 "comment_count": comment_count,
+                "like_count": like_count,
+                "liked_by_me": liked_by_me,
                 "is_mine": p.user_id == current_user.id,
             }
         )
@@ -807,20 +936,31 @@ async def gallery_detail(
         .order_by(GalleryComment.created_at.asc())
         .all()
     )
+    like_count = db.query(GalleryLike).filter(GalleryLike.post_id == post_id).count()
+    liked_by_me = (
+        db.query(GalleryLike)
+        .filter(GalleryLike.post_id == post_id, GalleryLike.user_id == current_user.id)
+        .first()
+        is not None
+    )
     return {
         "id": post.id,
         "content": post.content,
         "category": post.category,
         "author": author_display_name(post.user),
         "author_avatar": post.user.avatar_base64,
+        "author_level": calc_level(post.user.xp or 0),
         "created_at": post.created_at,
         "is_mine": post.user_id == current_user.id,
+        "like_count": like_count,
+        "liked_by_me": liked_by_me,
         "comments": [
             {
                 "id": c.id,
                 "content": c.content,
                 "author": author_display_name(c.user),
                 "author_avatar": c.user.avatar_base64,
+                "author_level": calc_level(c.user.xp or 0),
                 "created_at": c.created_at,
             }
             for c in comments
@@ -851,6 +991,23 @@ async def gallery_add_comment(
     db.add(comment)
     db.commit()
     db.refresh(comment)
+
+    if allowed:
+        add_xp(db, current_user, 3)
+        total_comments = (
+            db.query(GalleryComment)
+            .filter(GalleryComment.user_id == current_user.id, GalleryComment.status == "approved")
+            .count()
+        )
+        if total_comments >= 10:
+            grant_achievement(db, current_user, "soul_of_party")
+
+        if post.user_id != current_user.id:
+            owner = db.query(User).filter(User.id == post.user_id).first()
+            if owner:
+                add_xp(db, owner, 5)
+                notify(db, owner, f"💬 {author_display_name(current_user)} прокомментировал(а) твой промпт в галерее")
+
     return {"id": comment.id, "status": comment.status, "reject_reason": comment.reject_reason}
 
 
@@ -889,6 +1046,89 @@ async def gallery_delete_comment(
     db.delete(comment)
     db.commit()
     return {"status": "deleted"}
+
+
+@app.post("/api/gallery/{post_id}/like")
+async def gallery_toggle_like(
+    post_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Ставит лайк, если его ещё не было, либо убирает его (тогл)."""
+    post = db.query(GalleryPost).filter(GalleryPost.id == post_id, GalleryPost.status == "approved").first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Пост не найден")
+
+    existing = (
+        db.query(GalleryLike)
+        .filter(GalleryLike.post_id == post_id, GalleryLike.user_id == current_user.id)
+        .first()
+    )
+    if existing:
+        db.delete(existing)
+        db.commit()
+        liked = False
+    else:
+        db.add(GalleryLike(post_id=post_id, user_id=current_user.id))
+        db.commit()
+        liked = True
+
+        if post.user_id != current_user.id:
+            owner = db.query(User).filter(User.id == post.user_id).first()
+            if owner:
+                add_xp(db, owner, 3)
+                notify(db, owner, f"❤️ {author_display_name(current_user)} оценил(а) твой промпт в галерее")
+                total_likes_received = (
+                    db.query(GalleryLike)
+                    .join(GalleryPost, GalleryLike.post_id == GalleryPost.id)
+                    .filter(GalleryPost.user_id == owner.id)
+                    .count()
+                )
+                if total_likes_received >= 10:
+                    grant_achievement(db, owner, "liked_10")
+
+    like_count = db.query(GalleryLike).filter(GalleryLike.post_id == post_id).count()
+    return {"liked": liked, "like_count": like_count}
+
+
+# ==================== Достижения и личные уведомления ====================
+
+@app.get("/api/achievements")
+async def list_achievements(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Все достижения платформы + отметка, какие из них уже получены текущим пользователем."""
+    earned = {
+        a.key: a.earned_at
+        for a in db.query(UserAchievement).filter(UserAchievement.user_id == current_user.id).all()
+    }
+    return [
+        {
+            "key": key,
+            "label": info["label"],
+            "desc": info["desc"],
+            "earned": key in earned,
+            "earned_at": earned.get(key),
+        }
+        for key, info in ACHIEVEMENTS.items()
+    ]
+
+
+@app.get("/api/notifications")
+async def list_notifications(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Личные уведомления (лайки/комментарии/достижения) — отдельно от общей ленты обновлений."""
+    items = (
+        db.query(Notification)
+        .filter(Notification.user_id == current_user.id)
+        .order_by(Notification.created_at.desc())
+        .limit(30)
+        .all()
+    )
+    return [{"id": n.id, "content": n.content, "created_at": n.created_at} for n in items]
 
 
 # ==================== Лента оповещений об обновлениях ====================
@@ -935,6 +1175,7 @@ async def public_chat_list(
             "content": m.content,
             "author": author_display_name(m.user),
             "author_avatar": m.user.avatar_base64,
+            "author_level": calc_level(m.user.xp or 0),
             "created_at": m.created_at,
             "is_mine": m.user_id == current_user.id,
         }
@@ -959,6 +1200,9 @@ async def public_chat_send(
     db.add(message)
     db.commit()
     db.refresh(message)
+
+    if allowed:
+        add_xp(db, current_user, 2)
     return {"id": message.id, "status": message.status, "reject_reason": message.reject_reason}
 
 
@@ -1212,3 +1456,166 @@ async def bot_public_chat_send(req: BotPublicChatRequest, db: Session = Depends(
     db.commit()
     db.refresh(message)
     return {"status": message.status, "reject_reason": message.reject_reason}
+
+
+# ==================== Админ-панель (только для администратора) ====================
+
+@app.get("/api/admin/stats")
+async def admin_stats(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """Общая статистика проекта — для админ-панели на сайте."""
+    now = datetime.now(timezone.utc)
+    online_cutoff = now - timedelta(minutes=5)
+    today_start = datetime.combine(date.today(), datetime.min.time())
+    week_start = today_start - timedelta(days=7)
+
+    total_users = db.query(User).count()
+    online_now = db.query(User).filter(User.last_seen_at != None, User.last_seen_at >= online_cutoff).count()
+    active_today = db.query(User).filter(User.last_seen_at != None, User.last_seen_at >= today_start).count()
+    active_week = db.query(User).filter(User.last_seen_at != None, User.last_seen_at >= week_start).count()
+    new_today = db.query(User).filter(User.created_at >= today_start).count()
+    new_week = db.query(User).filter(User.created_at >= week_start).count()
+
+    total_chat_messages = db.query(Message).count()
+    total_public_messages = db.query(PublicChatMessage).count()
+
+    total_posts = db.query(GalleryPost).count()
+    approved_posts = db.query(GalleryPost).filter(GalleryPost.status == "approved").count()
+    rejected_posts = db.query(GalleryPost).filter(GalleryPost.status == "rejected").count()
+
+    total_comments = db.query(GalleryComment).count()
+    rejected_comments = db.query(GalleryComment).filter(GalleryComment.status == "rejected").count()
+    rejected_public_chat = db.query(PublicChatMessage).filter(PublicChatMessage.status == "rejected").count()
+
+    rejected_today = (
+        db.query(GalleryPost)
+        .filter(GalleryPost.status == "rejected", GalleryPost.created_at >= today_start)
+        .count()
+        + db.query(GalleryComment)
+        .filter(GalleryComment.status == "rejected", GalleryComment.created_at >= today_start)
+        .count()
+        + db.query(PublicChatMessage)
+        .filter(PublicChatMessage.status == "rejected", PublicChatMessage.created_at >= today_start)
+        .count()
+    )
+
+    total_likes = db.query(GalleryLike).count()
+    total_favorites = db.query(Favorite).count()
+
+    signups_by_day = []
+    for i in range(13, -1, -1):
+        day = date.today() - timedelta(days=i)
+        day_start = datetime.combine(day, datetime.min.time())
+        day_end = day_start + timedelta(days=1)
+        count = db.query(User).filter(User.created_at >= day_start, User.created_at < day_end).count()
+        signups_by_day.append({"date": day.isoformat(), "count": count})
+
+    return {
+        "online_now": online_now,
+        "total_users": total_users,
+        "active_today": active_today,
+        "active_week": active_week,
+        "new_today": new_today,
+        "new_week": new_week,
+        "total_messages": total_chat_messages + total_public_messages,
+        "total_gallery_posts": total_posts,
+        "approved_posts": approved_posts,
+        "rejected_posts": rejected_posts,
+        "total_comments": total_comments,
+        "rejected_comments": rejected_comments,
+        "rejected_public_chat": rejected_public_chat,
+        "rejected_today": rejected_today,
+        "total_likes": total_likes,
+        "total_favorites": total_favorites,
+        "signups_by_day": signups_by_day,
+    }
+
+
+@app.get("/api/admin/users")
+async def admin_users(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """Список пользователей (последние активные — сверху) — для админ-панели."""
+    now = datetime.now(timezone.utc)
+    users = db.query(User).order_by(User.last_seen_at.desc().nullslast()).limit(150).all()
+    result = []
+    for u in users:
+        is_online = bool(u.last_seen_at and (now - u.last_seen_at).total_seconds() <= 300)
+        result.append(
+            {
+                "id": u.id,
+                "name": author_display_name(u),
+                "avatar": u.avatar_base64,
+                "email": u.email,
+                "telegram_username": u.telegram_username,
+                "level": calc_level(u.xp or 0),
+                "xp": u.xp or 0,
+                "current_streak": u.current_streak or 0,
+                "created_at": u.created_at,
+                "last_seen_at": u.last_seen_at,
+                "is_online": is_online,
+                "is_admin": is_site_admin(u),
+            }
+        )
+    return result
+
+
+@app.get("/api/admin/leaderboard")
+async def admin_leaderboard(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """Топ-15 пользователей по опыту."""
+    users = db.query(User).order_by(User.xp.desc()).limit(15).all()
+    return [
+        {
+            "id": u.id,
+            "name": author_display_name(u),
+            "avatar": u.avatar_base64,
+            "xp": u.xp or 0,
+            "level": calc_level(u.xp or 0),
+        }
+        for u in users
+    ]
+
+
+@app.get("/api/admin/activity")
+async def admin_activity(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    """Лента последних событий (посты, комментарии, сообщения общего чата) — быстрый обзор модерации."""
+    events = []
+
+    for p in db.query(GalleryPost).order_by(GalleryPost.created_at.desc()).limit(20).all():
+        preview = p.content[:100] + ("…" if len(p.content) > 100 else "")
+        events.append(
+            {
+                "kind": "gallery_post",
+                "author": author_display_name(p.user),
+                "content": preview,
+                "status": p.status,
+                "reject_reason": p.reject_reason,
+                "created_at": p.created_at,
+            }
+        )
+
+    for c in db.query(GalleryComment).order_by(GalleryComment.created_at.desc()).limit(20).all():
+        preview = c.content[:100] + ("…" if len(c.content) > 100 else "")
+        events.append(
+            {
+                "kind": "gallery_comment",
+                "author": author_display_name(c.user),
+                "content": preview,
+                "status": c.status,
+                "reject_reason": c.reject_reason,
+                "created_at": c.created_at,
+            }
+        )
+
+    for m in db.query(PublicChatMessage).order_by(PublicChatMessage.created_at.desc()).limit(20).all():
+        preview = m.content[:100] + ("…" if len(m.content) > 100 else "")
+        events.append(
+            {
+                "kind": "public_chat",
+                "author": author_display_name(m.user),
+                "content": preview,
+                "status": m.status,
+                "reject_reason": m.reject_reason,
+                "created_at": m.created_at,
+            }
+        )
+
+    events.sort(key=lambda e: e["created_at"], reverse=True)
+    return events[:30]
