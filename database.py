@@ -10,7 +10,7 @@
 
 import os
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Date, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.sql import func
 
@@ -45,6 +45,12 @@ class User(Base):
     # Профиль (заполняется пользователем вручную в разделе "Аккаунт")
     display_name = Column(String, nullable=True)
     avatar_base64 = Column(Text, nullable=True)  # data URL целиком: "data:image/jpeg;base64,..."
+
+    # Геймификация
+    xp = Column(Integer, nullable=False, server_default="0")
+    current_streak = Column(Integer, nullable=False, server_default="0")
+    last_active_date = Column(Date, nullable=True)
+    last_seen_at = Column(DateTime(timezone=True), nullable=True)  # для "онлайн сейчас" в админке
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -135,6 +141,39 @@ class Announcement(Base):
     id = Column(Integer, primary_key=True, index=True)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class GalleryLike(Base):
+    """Лайк на пост галереи — один пользователь может лайкнуть пост только один раз."""
+    __tablename__ = "gallery_likes"
+    __table_args__ = (UniqueConstraint("post_id", "user_id", name="uq_gallery_like_post_user"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("gallery_posts.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class Notification(Base):
+    """Личное уведомление пользователю (лайк/комментарий к его посту) — не путать с Announcement
+    (это общая лента обновлений от админа, а это — персональные события)."""
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserAchievement(Base):
+    """Полученное пользователем достижение — key соответствует ключу из списка в main.py."""
+    __tablename__ = "user_achievements"
+    __table_args__ = (UniqueConstraint("user_id", "key", name="uq_user_achievement"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    key = Column(String, nullable=False)
+    earned_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
 def init_db():
