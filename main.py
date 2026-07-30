@@ -14,7 +14,9 @@ import base64
 import logging
 import math
 import os
+import secrets
 import tempfile
+import time
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header
@@ -652,6 +654,90 @@ async def telegram_login(req: TelegramAuthRequest, db: Session = Depends(get_db)
             "telegram_first_name": user.telegram_first_name,
         },
     }
+
+
+# ==================== Вход через бота (альтернатива виджету, без привязки к домену) ====================
+# Сайт создаёт одноразовый токен и показывает ссылку на бота с этим токеном в /start.
+# Бот, получив /start web_auth_<токен>, подтверждает его на бэкенде — сайт узнаёт об этом через опрос.
+
+BOT_USERNAME = "halpervovan_bot"
+TELEGRAM_LOGIN_TTL_SECONDS = 300  # 5 минут на подтверждение
+
+# token -> {"status": "pending"/"confirmed", "created_at": float, "telegram_id"/"telegram_username"/"telegram_first_name"}
+pending_telegram_logins: dict[str, dict] = {}
+
+
+class BotTelegramAuthConfirmRequest(BaseModel):
+    token: str
+    telegram_id: int
+    telegram_username: str | None = None
+    telegram_first_name: str | None = None
+
+
+@app.post("/api/auth/telegram/start")
+async def telegram_login_start():
+    """Генерирует одноразовый токен для входа через бота — сайт покажет ссылку и начнёт опрос."""
+    token = secrets.token_urlsafe(24)
+    pending_telegram_logins[token] = {"status": "pending", "created_at": time.time()}
+    return {"token": token, "bot_username": BOT_USERNAME}
+
+
+@app.get("/api/auth/telegram/poll")
+async def telegram_login_poll(token: str, db: Session = Depends(get_db)):
+    """Сайт опрашивает это раз в пару секунд, пока пользователь не подтвердит вход через бота."""
+    entry = pending_telegram_logins.get(token)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Токен не найден или уже использован")
+
+    if time.time() - entry["created_at"] > TELEGRAM_LOGIN_TTL_SECONDS:
+        pending_telegram_logins.pop(token, None)
+        raise HTTPException(status_code=410, detail="Время авторизации истекло — попробуй ещё раз")
+
+    if entry["status"] != "confirmed":
+        return {"status": "pending"}
+
+    pending_telegram_logins.pop(token, None)
+
+    telegram_id = str(entry["telegram_id"])
+    user = db.query(User).filter(User.telegram_id == telegram_id).first()
+    if user is None:
+        user = User(
+            telegram_id=telegram_id,
+            telegram_username=entry.get("telegram_username"),
+            telegram_first_name=entry.get("telegram_first_name"),
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    else:
+        user.telegram_username = entry.get("telegram_username")
+        user.telegram_first_name = entry.get("telegram_first_name")
+        db.commit()
+
+    access_token = auth.create_access_token(user.id)
+    return {
+        "status": "confirmed",
+        "access_token": access_token,
+        "user": {
+            "id": user.id,
+            "telegram_username": user.telegram_username,
+            "telegram_first_name": user.telegram_first_name,
+        },
+    }
+
+
+@app.post("/api/bot/telegram-auth-confirm", dependencies=[Depends(verify_bot_secret)])
+async def bot_telegram_auth_confirm(req: BotTelegramAuthConfirmRequest):
+    """Бот вызывает это, когда пользователь прислал ему /start web_auth_<токен>."""
+    entry = pending_telegram_logins.get(req.token)
+    if not entry:
+        return {"status": "not_found"}
+
+    entry["status"] = "confirmed"
+    entry["telegram_id"] = req.telegram_id
+    entry["telegram_username"] = req.telegram_username
+    entry["telegram_first_name"] = req.telegram_first_name
+    return {"status": "ok"}
 
 
 @app.get("/api/me")
