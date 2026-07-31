@@ -176,6 +176,50 @@ class UserAchievement(Base):
     earned_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class Room(Base):
+    """Совместная комната — 2+ человек сочиняют один промпт вместе."""
+    __tablename__ = "rooms"
+
+    id = Column(Integer, primary_key=True, index=True)
+    code = Column(String, unique=True, index=True, nullable=False)
+    category = Column(String, nullable=False, server_default="other")  # suno/image/video/other
+    status = Column(String, nullable=False, server_default="open")  # open/finished
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    final_content = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    participants = relationship("RoomParticipant", back_populates="room", cascade="all, delete-orphan")
+    messages = relationship("RoomMessage", back_populates="room", cascade="all, delete-orphan")
+
+
+class RoomParticipant(Base):
+    """Участник комнаты."""
+    __tablename__ = "room_participants"
+    __table_args__ = (UniqueConstraint("room_id", "user_id", name="uq_room_participant"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    joined_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    room = relationship("Room", back_populates="participants")
+    user = relationship("User")
+
+
+class RoomMessage(Base):
+    """Сообщение в совместной комнате — от участника или от нейросети (user_id=NULL)."""
+    __tablename__ = "room_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # NULL — сообщение от ИИ
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    room = relationship("Room", back_populates="messages")
+    user = relationship("User")
+
+
 def init_db():
     """Создаёт таблицы, если их ещё нет. Вызывается один раз при старте приложения.
     ВАЖНО: create_all создаёт только отсутствующие ТАБЛИЦЫ целиком, но не добавляет
