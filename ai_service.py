@@ -112,6 +112,56 @@ def moderate_text(text: str) -> tuple[bool, str]:
         return False, "Не удалось проверить текст, попробуй опубликовать ещё раз чуть позже"
 
 
+# ==================== Совместные комнаты (несколько человек сочиняют промпт вместе) ====================
+
+ROOM_CATEGORY_LABELS = {
+    "suno": "музыки (Suno)",
+    "image": "картинки",
+    "video": "видео",
+    "other": "общего творческого промпта",
+}
+
+
+def get_room_reply(category: str, participant_names: list[str], history: list[dict]) -> str:
+    """Ответ нейросети в совместной комнате — учитывает, что пишут НЕСКОЛЬКО человек сразу,
+    и явно сплетает их идеи в одну общую концепцию, а не отвечает каждому по отдельности."""
+    label = ROOM_CATEGORY_LABELS.get(category, ROOM_CATEGORY_LABELS["other"])
+    names = ", ".join(participant_names) if participant_names else "участники"
+    system_prompt = (
+        f"Ты помогаешь нескольким людям вместе придумать промпт для {label}. Сейчас в комнате: {names}.\n"
+        "Каждое сообщение в истории подписано именем того, кто его написал — обращайся к людям по "
+        "именам, аккуратно объединяй их идеи в ОДНУ общую концепцию, а не отвечай каждому отдельно. "
+        "Если предложения противоречат друг другу — предложи компромисс или уточни, что важнее. "
+        "Задавай нацеленные вопросы, если деталей не хватает. Когда идея достаточно оформлена, мягко "
+        "предложи нажать кнопку «Готово», чтобы получить финальный промпт.\n"
+        "Пиши живо и по-дружески, короткими репликами, на русском."
+    )
+    messages = [{"role": "system", "content": system_prompt}] + history[-20:]
+    try:
+        return chat_completion_with_fallback(messages, temperature=0.85, max_tokens=700)
+    except Exception as e:
+        logging.exception("Ошибка при ответе в совместной комнате")
+        return describe_groq_error(e)
+
+
+def get_room_final_prompt(category: str, history: list[dict]) -> str:
+    """Собирает финальный готовый промпт из всей истории обсуждения в комнате."""
+    label = ROOM_CATEGORY_LABELS.get(category, ROOM_CATEGORY_LABELS["other"])
+    system_prompt = (
+        f"На основе всего разговора ниже сформируй ГОТОВЫЙ промпт для {label}, объединяющий идеи "
+        "всех участников обсуждения. Обязательно начни строго со строки 'ГОТОВЫЙ ПРОМПТ:' на "
+        "отдельной строке, дальше сам промпт (можно на английском, если так эффективнее для нужной "
+        "нейросети). После промпта можно коротко, в одну строку, пояснить по-русски, что учли из идей "
+        "каждого участника."
+    )
+    messages = [{"role": "system", "content": system_prompt}] + history[-40:]
+    try:
+        return chat_completion_with_fallback(messages, temperature=0.7, max_tokens=900)
+    except Exception as e:
+        logging.exception("Ошибка при составлении финального промпта комнаты")
+        return describe_groq_error(e)
+
+
 SYSTEM_PROMPT = "Ты дружелюбный ассистент, отвечай кратко и по делу на русском языке."
 
 # ==================== РОЛИ ДЛЯ РАЗДЕЛА "ОБЩЕНИЕ" ====================
