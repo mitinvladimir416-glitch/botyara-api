@@ -40,6 +40,9 @@ from database import (
     GalleryLike,
     Notification,
     UserAchievement,
+    Room,
+    RoomParticipant,
+    RoomMessage,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -240,6 +243,18 @@ class BotFavoriteRequest(BaseModel):
 class BotFavoriteDeleteRequest(BaseModel):
     telegram_id: int
     favorite_id: int
+
+
+class RoomCreateRequest(BaseModel):
+    category: str = "other"  # suno/image/video/other
+
+
+class RoomJoinRequest(BaseModel):
+    code: str
+
+
+class RoomMessageRequest(BaseModel):
+    content: str
 
 
 class GalleryPublishRequest(BaseModel):
@@ -1659,3 +1674,227 @@ async def admin_activity(current_user: User = Depends(require_admin), db: Sessio
 
     events.sort(key=lambda e: e["created_at"], reverse=True)
     return events[:30]
+
+
+# ==================== Совместные комнаты (несколько человек сочиняют промпт вместе) ====================
+
+MAX_ROOM_PARTICIPANTS = 5
+
+
+def generate_room_code() -> str:
+    """Короткий код комнаты для приглашения (например, 8X2F4K)."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # без похожих символов (0/O, 1/I)
+    return "".join(secrets.choice(alphabet) for _ in range(6))
+
+
+def get_room_or_404(db: Session, code: str) -> Room:
+    room = db.query(Room).filter(Room.code == code.upper()).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Комната не найдена — проверь код")
+    return room
+
+
+def require_room_participant(db: Session, room: Room, user: User) -> None:
+    is_in = (
+        db.query(RoomParticipant)
+        .filter(RoomParticipant.room_id == room.id, RoomParticipant.user_id == user.id)
+        .first()
+    )
+    if not is_in:
+        raise HTTPException(status_code=403, detail="Ты не участник этой комнаты")
+
+
+def serialize_room(db: Session, room: Room, current_user: User) -> dict:
+    participants = db.query(RoomParticipant).filter(RoomParticipant.room_id == room.id).all()
+    messages = db.query(RoomMessage).filter(RoomMessage.room_id == room.id).order_by(RoomMessage.created_at.asc()).all()
+    return {
+        "code": room.code,
+        "category": room.category,
+        "status": room.status,
+        "final_content": room.final_content,
+        "is_owner": room.created_by == current_user.id,
+        "participants": [
+            {
+                "id": p.user.id,
+                "name": author_display_name(p.user),
+                "avatar": p.user.avatar_base64,
+                "level": calc_level(p.user.xp or 0),
+                "is_me": p.user.id == current_user.id,
+            }
+            for p in participants
+        ],
+        "messages": [
+            {
+                "id": m.id,
+                "content": m.content,
+                "author": author_display_name(m.user) if m.user else "🤖 Нейросеть",
+                "author_avatar": m.user.avatar_base64 if m.user else None,
+                "is_mine": m.user_id == current_user.id if m.user_id else False,
+                "is_ai": m.user_id is None,
+                "created_at": m.created_at,
+            }
+            for m in messages
+        ],
+    }
+
+
+@app.post("/api/rooms")
+async def create_room(
+    req: RoomCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Создаёт новую совместную комнату — автор автоматически становится первым участником."""
+    code = generate_room_code()
+    while db.query(Room).filter(Room.code == code).first():
+        code = generate_room_code()
+
+    room = Room(code=code, category=req.category or "other", created_by=current_user.id)
+    db.add(room)
+    db.commit()
+    db.refresh(room)
+
+    db.add(RoomParticipant(room_id=room.id, user_id=current_user.id))
+    db.commit()
+
+    return serialize_room(db, room, current_user)
+
+
+@app.post("/api/rooms/join")
+async def join_room(
+    req: RoomJoinRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Присоединяет текущего пользователя к комнате по коду."""
+    room = get_room_or_404(db, req.code)
+
+    if room.status != "open":
+        raise HTTPException(status_code=400, detail="Эта комната уже завершена")
+
+    already_in = (
+        db.query(RoomParticipant)
+        .filter(RoomParticipant.room_id == room.id, RoomParticipant.user_id == current_user.id)
+        .first()
+    )
+    if not already_in:
+        count = db.query(RoomParticipant).filter(RoomParticipant.room_id == room.id).count()
+        if count >= MAX_ROOM_PARTICIPANTS:
+            raise HTTPException(status_code=400, detail="В комнате уже максимум участников")
+        db.add(RoomParticipant(room_id=room.id, user_id=current_user.id))
+        db.commit()
+
+    return serialize_room(db, room, current_user)
+
+
+@app.get("/api/rooms/{code}")
+async def get_room(
+    code: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Состояние комнаты целиком — участники и вся история сообщений."""
+    room = get_room_or_404(db, code)
+    require_room_participant(db, room, current_user)
+    return serialize_room(db, room, current_user)
+
+
+@app.post("/api/rooms/{code}/messages")
+async def send_room_message(
+    code: str,
+    req: RoomMessageRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Сообщение в комнате — сохраняется, и нейросеть сразу отвечает всем участникам."""
+    room = get_room_or_404(db, code)
+    require_room_participant(db, room, current_user)
+
+    if room.status != "open":
+        raise HTTPException(status_code=400, detail="Комната уже завершена")
+
+    db.add(RoomMessage(room_id=room.id, user_id=current_user.id, content=req.content))
+    db.commit()
+    add_xp(db, current_user, 2)
+
+    participants = db.query(RoomParticipant).filter(RoomParticipant.room_id == room.id).all()
+    participant_names = [author_display_name(p.user) for p in participants]
+
+    history_rows = db.query(RoomMessage).filter(RoomMessage.room_id == room.id).order_by(RoomMessage.created_at.asc()).all()
+    history = [
+        {
+            "role": "assistant" if h.user_id is None else "user",
+            "content": h.content if h.user_id is None else f"{author_display_name(h.user)}: {h.content}",
+        }
+        for h in history_rows
+    ]
+
+    reply = ai_service.get_room_reply(room.category, participant_names, history)
+    db.add(RoomMessage(room_id=room.id, user_id=None, content=reply))
+    db.commit()
+
+    return serialize_room(db, room, current_user)
+
+
+@app.post("/api/rooms/{code}/finish")
+async def finish_room(
+    code: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Завершает комнату — нейросеть собирает финальный промпт, он попадает в избранное всем участникам."""
+    room = get_room_or_404(db, code)
+    require_room_participant(db, room, current_user)
+
+    if room.status != "open":
+        return serialize_room(db, room, current_user)
+
+    history_rows = db.query(RoomMessage).filter(RoomMessage.room_id == room.id).order_by(RoomMessage.created_at.asc()).all()
+    if not history_rows:
+        raise HTTPException(status_code=400, detail="В комнате пока нет ни одного сообщения")
+
+    history = [
+        {
+            "role": "assistant" if h.user_id is None else "user",
+            "content": h.content if h.user_id is None else f"{author_display_name(h.user)}: {h.content}",
+        }
+        for h in history_rows
+    ]
+
+    final_text = ai_service.get_room_final_prompt(room.category, history)
+    room.final_content = final_text
+    room.status = "finished"
+    db.commit()
+
+    participants = db.query(RoomParticipant).filter(RoomParticipant.room_id == room.id).all()
+    for p in participants:
+        db.add(Favorite(user_id=p.user_id, content=final_text, category=room.category))
+        add_xp(db, p.user, 10)
+    db.commit()
+
+    return serialize_room(db, room, current_user)
+
+
+@app.get("/api/rooms")
+async def list_my_rooms(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Комнаты, в которых участвует текущий пользователь (для быстрого возврата)."""
+    rows = (
+        db.query(RoomParticipant)
+        .filter(RoomParticipant.user_id == current_user.id)
+        .join(Room, RoomParticipant.room_id == Room.id)
+        .order_by(Room.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    return [
+        {
+            "code": r.room.code,
+            "category": r.room.category,
+            "status": r.room.status,
+            "created_at": r.room.created_at,
+        }
+        for r in rows
+    ]
