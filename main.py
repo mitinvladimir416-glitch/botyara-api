@@ -196,16 +196,6 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class TelegramAuthRequest(BaseModel):
-    # Поля, которые присылает Telegram Login Widget
-    id: int
-    first_name: str | None = None
-    username: str | None = None
-    photo_url: str | None = None
-    auth_date: int
-    hash: str
-
-
 class FavoriteCreateRequest(BaseModel):
     content: str
     category: str = "other"  # "suno" / "image" / "video" / "cover" / "other"
@@ -618,42 +608,6 @@ async def login(req: LoginRequest, db: Session = Depends(get_db)):
 
     token = auth.create_access_token(user.id)
     return {"access_token": token, "user": {"id": user.id, "email": user.email}}
-
-
-@app.post("/api/auth/telegram")
-async def telegram_login(req: TelegramAuthRequest, db: Session = Depends(get_db)):
-    """Вход через Telegram Login Widget. Если пользователь с таким Telegram ID уже есть — логиним его,
-    иначе создаём нового."""
-    if not auth.verify_telegram_login(req.model_dump()):
-        raise HTTPException(status_code=401, detail="Не удалось подтвердить данные от Telegram")
-
-    telegram_id = str(req.id)
-    user = db.query(User).filter(User.telegram_id == telegram_id).first()
-
-    if user is None:
-        user = User(
-            telegram_id=telegram_id,
-            telegram_username=req.username,
-            telegram_first_name=req.first_name,
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    else:
-        # Обновляем актуальные данные профиля на случай, если человек их поменял в Telegram
-        user.telegram_username = req.username
-        user.telegram_first_name = req.first_name
-        db.commit()
-
-    token = auth.create_access_token(user.id)
-    return {
-        "access_token": token,
-        "user": {
-            "id": user.id,
-            "telegram_username": user.telegram_username,
-            "telegram_first_name": user.telegram_first_name,
-        },
-    }
 
 
 # ==================== Вход через бота (альтернатива виджету, без привязки к домену) ====================
