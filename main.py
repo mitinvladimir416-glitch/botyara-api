@@ -88,6 +88,20 @@ def ensure_not_banned(user: User) -> None:
         raise HTTPException(status_code=403, detail="Твой аккаунт ограничен модератором")
 
 
+# Простая защита от спама — в памяти, без БД. Не переживает перезапуск сервиса, и это ок:
+# цель просто не дать засыпать чат/галерею сообщениями быстрее разумного.
+_rate_limit_state: dict[str, list[float]] = {}
+
+
+def check_rate_limit(key: str, max_calls: int, window_seconds: float) -> None:
+    now = time.time()
+    calls = _rate_limit_state.setdefault(key, [])
+    calls[:] = [t for t in calls if now - t < window_seconds]
+    if len(calls) >= max_calls:
+        raise HTTPException(status_code=429, detail="Слишком часто — подожди немного и попробуй снова")
+    calls.append(now)
+
+
 def author_badge(user: User) -> dict | None:
     """Кастомное 'украшение' — короткий титул с цветом, который админ выдал аккаунту вручную."""
     if not user.badge_text:
@@ -111,7 +125,12 @@ ACHIEVEMENTS = {
     "soul_of_party": {"label": "🎉 Душа компании", "desc": "Оставил 10 комментариев в галерее"},
     "streak_7": {"label": "🔥 Неделя подряд", "desc": "7 дней подряд на сайте"},
     "streak_30": {"label": "🏆 Месяц подряд", "desc": "30 дней подряд на сайте"},
-    "liked_10": {"label": "❤️ Народная любовь", "desc": "Твои посты в сумме набрали 10 лайков"},
+    "liked_10": {"label": "❤️ Народная любовь", "desc": "Твои посты в сумме набрали 10 реакций"},
+    "reactions_50": {"label": "🌟 Звезда галереи", "desc": "Твои посты в сумме набрали 50 реакций"},
+    "role_explorer": {"label": "🎭 Исследователь ролей", "desc": "Пообщался со всеми ролями в разделе «Общение»"},
+    "room_organizer": {"label": "🤝 Организатор", "desc": "Создал 5 совместных комнат"},
+    "night_owl": {"label": "🦉 Полуночник", "desc": "Написал сообщение глубокой ночью"},
+    "active_reactor": {"label": "👀 Активный зритель", "desc": "Поставил 50 реакций на чужие посты"},
 }
 
 
@@ -215,6 +234,12 @@ class PromptRequest(BaseModel):
     history: list[ChatMessage]
 
 
+class ImprovePromptRequest(BaseModel):
+    topic: str
+    target: str | None = None
+    draft: str
+
+
 class CoverRequest(BaseModel):
     lyrics: str
     ratio: str  # один из: 1:1, 4:3, 16:9, 3:4, 9:16
@@ -301,6 +326,10 @@ class RoomMessageRequest(BaseModel):
 
 class GalleryPublishRequest(BaseModel):
     favorite_id: int
+
+
+class GalleryReactRequest(BaseModel):
+    emoji: str
 
 
 class GalleryCommentRequest(BaseModel):
@@ -468,6 +497,19 @@ async def chat(
 
     add_xp(db, current_user, 1)
 
+    distinct_personas = (
+        db.query(Message.persona)
+        .filter(Message.user_id == current_user.id, Message.role == "user")
+        .distinct()
+        .count()
+    )
+    if distinct_personas >= len(ai_service.ROLE_CONFIG):
+        grant_achievement(db, current_user, "role_explorer")
+
+    current_hour = datetime.now(timezone.utc).hour
+    if current_hour in (0, 1, 2, 3, 4):
+        grant_achievement(db, current_user, "night_owl")
+
     return {"reply": reply}
 
 
@@ -558,6 +600,16 @@ async def prompt(req: PromptRequest):
         raise HTTPException(status_code=400, detail="Неизвестная тема промпта")
     history = [m.model_dump() for m in req.history]
     reply = ai_service.get_prompt_reply(req.topic, req.target, history)
+    is_final = "ГОТОВЫЙ ПРОМПТ:" in reply
+    return {"reply": reply, "is_final": is_final}
+
+
+@app.post("/api/prompt/improve")
+async def improve_prompt_endpoint(req: ImprovePromptRequest):
+    """«Прокачай мой промпт» — доводит уже написанный пользователем черновик до ума."""
+    if not req.draft.strip():
+        raise HTTPException(status_code=400, detail="Пришли черновик текста")
+    reply = ai_service.improve_prompt(req.topic, req.target, req.draft)
     is_final = "ГОТОВЫЙ ПРОМПТ:" in reply
     return {"reply": reply, "is_final": is_final}
 
@@ -983,17 +1035,15 @@ async def gallery_publish(
 
 @app.get("/api/gallery")
 async def gallery_list(
+    q: str = "",
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Список опубликованных (прошедших модерацию) промптов, новые сверху."""
-    posts = (
-        db.query(GalleryPost)
-        .filter(GalleryPost.status == "approved")
-        .order_by(GalleryPost.created_at.desc())
-        .limit(50)
-        .all()
-    )
+    """Список опубликованных (прошедших модерацию) промптов, новые сверху. q — поиск по тексту."""
+    query = db.query(GalleryPost).filter(GalleryPost.status == "approved")
+    if q.strip():
+        query = query.filter(GalleryPost.content.ilike(f"%{q.strip()}%"))
+    posts = query.order_by(GalleryPost.created_at.desc()).limit(50).all()
     result = []
     for p in posts:
         comment_count = (
@@ -1001,26 +1051,27 @@ async def gallery_list(
             .filter(GalleryComment.post_id == p.id, GalleryComment.status == "approved")
             .count()
         )
-        like_count = db.query(GalleryLike).filter(GalleryLike.post_id == p.id).count()
-        liked_by_me = (
-            db.query(GalleryLike)
-            .filter(GalleryLike.post_id == p.id, GalleryLike.user_id == current_user.id)
-            .first()
-            is not None
-        )
+        reaction_rows = db.query(GalleryLike).filter(GalleryLike.post_id == p.id).all()
+        reactions = {}
+        my_reaction = None
+        for r in reaction_rows:
+            reactions[r.emoji] = reactions.get(r.emoji, 0) + 1
+            if r.user_id == current_user.id:
+                my_reaction = r.emoji
         result.append(
             {
                 "id": p.id,
                 "content": p.content,
                 "category": p.category,
                 "author": author_display_name(p.user),
+                "author_id": p.user.id,
                 "author_avatar": p.user.avatar_base64,
                 "author_level": calc_level(p.user.xp or 0),
                 "author_badge": author_badge(p.user),
                 "created_at": p.created_at,
                 "comment_count": comment_count,
-                "like_count": like_count,
-                "liked_by_me": liked_by_me,
+                "reactions": reactions,
+                "my_reaction": my_reaction,
                 "is_mine": p.user_id == current_user.id,
             }
         )
@@ -1044,30 +1095,32 @@ async def gallery_detail(
         .order_by(GalleryComment.created_at.asc())
         .all()
     )
-    like_count = db.query(GalleryLike).filter(GalleryLike.post_id == post_id).count()
-    liked_by_me = (
-        db.query(GalleryLike)
-        .filter(GalleryLike.post_id == post_id, GalleryLike.user_id == current_user.id)
-        .first()
-        is not None
-    )
+    reaction_rows = db.query(GalleryLike).filter(GalleryLike.post_id == post_id).all()
+    reactions = {}
+    my_reaction = None
+    for r in reaction_rows:
+        reactions[r.emoji] = reactions.get(r.emoji, 0) + 1
+        if r.user_id == current_user.id:
+            my_reaction = r.emoji
     return {
         "id": post.id,
         "content": post.content,
         "category": post.category,
         "author": author_display_name(post.user),
+        "author_id": post.user.id,
         "author_avatar": post.user.avatar_base64,
         "author_level": calc_level(post.user.xp or 0),
         "author_badge": author_badge(post.user),
         "created_at": post.created_at,
         "is_mine": post.user_id == current_user.id,
-        "like_count": like_count,
-        "liked_by_me": liked_by_me,
+        "reactions": reactions,
+        "my_reaction": my_reaction,
         "comments": [
             {
                 "id": c.id,
                 "content": c.content,
                 "author": author_display_name(c.user),
+                "author_id": c.user.id,
                 "author_avatar": c.user.avatar_base64,
                 "author_level": calc_level(c.user.xp or 0),
                 "author_badge": author_badge(c.user),
@@ -1087,6 +1140,7 @@ async def gallery_add_comment(
 ):
     """Добавляет комментарий к посту — тоже проходит модерацию перед публикацией."""
     ensure_not_banned(current_user)
+    check_rate_limit(f"gallery_comment:{current_user.id}", max_calls=15, window_seconds=60)
     post = db.query(GalleryPost).filter(GalleryPost.id == post_id, GalleryPost.status == "approved").first()
     if not post:
         raise HTTPException(status_code=404, detail="Пост не найден")
@@ -1159,13 +1213,21 @@ async def gallery_delete_comment(
     return {"status": "deleted"}
 
 
-@app.post("/api/gallery/{post_id}/like")
-async def gallery_toggle_like(
+REACTION_EMOJIS = ["❤️", "🔥", "😂", "👀", "💯"]
+
+
+@app.post("/api/gallery/{post_id}/react")
+async def gallery_react(
     post_id: int,
+    req: GalleryReactRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Ставит лайк, если его ещё не было, либо убирает его (тогл)."""
+    """Ставит реакцию (один из набора эмодзи). Повторный клик тем же эмодзи убирает реакцию,
+    клик другим эмодзи — заменяет."""
+    if req.emoji not in REACTION_EMOJIS:
+        raise HTTPException(status_code=400, detail="Неизвестная реакция")
+
     post = db.query(GalleryPost).filter(GalleryPost.id == post_id, GalleryPost.status == "approved").first()
     if not post:
         raise HTTPException(status_code=404, detail="Пост не найден")
@@ -1175,31 +1237,49 @@ async def gallery_toggle_like(
         .filter(GalleryLike.post_id == post_id, GalleryLike.user_id == current_user.id)
         .first()
     )
-    if existing:
+
+    if existing and existing.emoji == req.emoji:
         db.delete(existing)
         db.commit()
-        liked = False
+        my_reaction = None
     else:
-        db.add(GalleryLike(post_id=post_id, user_id=current_user.id))
+        is_new = existing is None
+        if existing:
+            existing.emoji = req.emoji
+        else:
+            db.add(GalleryLike(post_id=post_id, user_id=current_user.id, emoji=req.emoji))
         db.commit()
-        liked = True
+        my_reaction = req.emoji
 
-        if post.user_id != current_user.id:
+        if is_new and post.user_id != current_user.id:
             owner = db.query(User).filter(User.id == post.user_id).first()
             if owner:
                 add_xp(db, owner, 3)
-                notify(db, owner, f"❤️ {author_display_name(current_user)} оценил(а) твой промпт в галерее")
-                total_likes_received = (
+                notify(db, owner, f"{req.emoji} {author_display_name(current_user)} отреагировал(а) на твой промпт в галерее")
+                total_reactions_received = (
                     db.query(GalleryLike)
                     .join(GalleryPost, GalleryLike.post_id == GalleryPost.id)
                     .filter(GalleryPost.user_id == owner.id)
                     .count()
                 )
-                if total_likes_received >= 10:
+                if total_reactions_received >= 10:
                     grant_achievement(db, owner, "liked_10")
+                if total_reactions_received >= 50:
+                    grant_achievement(db, owner, "reactions_50")
 
-    like_count = db.query(GalleryLike).filter(GalleryLike.post_id == post_id).count()
-    return {"liked": liked, "like_count": like_count}
+        if is_new:
+            my_total_reactions_given = (
+                db.query(GalleryLike).filter(GalleryLike.user_id == current_user.id).count()
+            )
+            if my_total_reactions_given >= 50:
+                grant_achievement(db, current_user, "active_reactor")
+
+    rows = db.query(GalleryLike).filter(GalleryLike.post_id == post_id).all()
+    counts = {}
+    for r in rows:
+        counts[r.emoji] = counts.get(r.emoji, 0) + 1
+
+    return {"reactions": counts, "my_reaction": my_reaction}
 
 
 # ==================== Достижения и личные уведомления ====================
@@ -1296,6 +1376,7 @@ async def public_chat_list(
             "id": m.id,
             "content": m.content,
             "author": author_display_name(m.user),
+            "author_id": m.user.id,
             "author_avatar": m.user.avatar_base64,
             "author_level": calc_level(m.user.xp or 0),
             "author_badge": author_badge(m.user),
@@ -1314,6 +1395,7 @@ async def public_chat_send(
 ):
     """Отправляет сообщение в общий чат — проходит модерацию перед показом всем."""
     ensure_not_banned(current_user)
+    check_rate_limit(f"public_chat:{current_user.id}", max_calls=10, window_seconds=30)
     allowed, reason = ai_service.moderate_text(req.content)
     message = PublicChatMessage(
         user_id=current_user.id,
@@ -1749,6 +1831,10 @@ async def admin_activity(current_user: User = Depends(require_admin), db: Sessio
 
 MAX_ROOM_PARTICIPANTS = 5
 
+# Временное состояние "печатает…" в комнатах — не персистентное (в памяти), это нормально:
+# room_code -> {user_id: время последнего "тик" от клиента}
+room_typing_state: dict[str, dict[int, float]] = {}
+
 
 def generate_room_code() -> str:
     """Короткий код комнаты для приглашения (например, 8X2F4K)."""
@@ -1776,12 +1862,22 @@ def require_room_participant(db: Session, room: Room, user: User) -> None:
 def serialize_room(db: Session, room: Room, current_user: User) -> dict:
     participants = db.query(RoomParticipant).filter(RoomParticipant.room_id == room.id).all()
     messages = db.query(RoomMessage).filter(RoomMessage.room_id == room.id).order_by(RoomMessage.created_at.asc()).all()
+
+    now = time.time()
+    typing_state = room_typing_state.get(room.code, {})
+    typing_names = [
+        author_display_name(p.user)
+        for p in participants
+        if p.user.id != current_user.id and now - typing_state.get(p.user.id, 0) < 4
+    ]
+
     return {
         "code": room.code,
         "category": room.category,
         "status": room.status,
         "final_content": room.final_content,
         "is_owner": room.created_by == current_user.id,
+        "typing": typing_names,
         "participants": [
             {
                 "id": p.user.id,
@@ -1828,6 +1924,10 @@ async def create_room(
     db.add(RoomParticipant(room_id=room.id, user_id=current_user.id))
     db.commit()
 
+    total_created = db.query(Room).filter(Room.created_by == current_user.id).count()
+    if total_created >= 5:
+        grant_achievement(db, current_user, "room_organizer")
+
     return serialize_room(db, room, current_user)
 
 
@@ -1870,6 +1970,19 @@ async def get_room(
     return serialize_room(db, room, current_user)
 
 
+@app.post("/api/rooms/{code}/typing")
+async def room_typing_ping(
+    code: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Лёгкий "тик" — сайт вызывает это, пока пользователь печатает в комнате."""
+    room = get_room_or_404(db, code)
+    require_room_participant(db, room, current_user)
+    room_typing_state.setdefault(room.code, {})[current_user.id] = time.time()
+    return {"status": "ok"}
+
+
 @app.post("/api/rooms/{code}/messages")
 async def send_room_message(
     code: str,
@@ -1887,6 +2000,8 @@ async def send_room_message(
 
     if room.status != "open":
         raise HTTPException(status_code=400, detail="Комната уже завершена")
+
+    check_rate_limit(f"room_message:{current_user.id}", max_calls=20, window_seconds=30)
 
     channel = "team" if req.channel == "team" else "ai"
     db.add(RoomMessage(room_id=room.id, user_id=current_user.id, channel=channel, content=req.content))
@@ -2089,3 +2204,61 @@ async def admin_update_user(
 
     db.commit()
     return serialize_admin_user(target, current_user)
+
+
+# ==================== Публичный профиль пользователя ====================
+
+@app.get("/api/users/{user_id}/public")
+async def public_user_profile(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Публичная страница профиля — видна любому вошедшему пользователю.
+    Никаких приватных данных (email, telegram id) сюда не попадает."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+    level = calc_level(user.xp or 0)
+    earned = {
+        a.key: a.earned_at
+        for a in db.query(UserAchievement).filter(UserAchievement.user_id == user.id).all()
+    }
+    achievements = [
+        {"key": key, "label": info["label"], "desc": info["desc"], "earned_at": earned[key]}
+        for key, info in ACHIEVEMENTS.items()
+        if key in earned
+    ]
+
+    posts = (
+        db.query(GalleryPost)
+        .filter(GalleryPost.user_id == user.id, GalleryPost.status == "approved")
+        .order_by(GalleryPost.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    gallery_posts = [
+        {
+            "id": p.id,
+            "content": p.content[:200] + ("…" if len(p.content) > 200 else ""),
+            "category": p.category,
+            "created_at": p.created_at,
+        }
+        for p in posts
+    ]
+
+    return {
+        "id": user.id,
+        "name": author_display_name(user),
+        "avatar": user.avatar_base64,
+        "level": level,
+        "level_title": level_title(level),
+        "xp": user.xp or 0,
+        "current_streak": user.current_streak or 0,
+        "badge": author_badge(user),
+        "achievements": achievements,
+        "gallery_posts": gallery_posts,
+        "joined_at": user.created_at,
+        "is_me": user.id == current_user.id,
+    }
