@@ -135,6 +135,24 @@ class PublicChatMessage(Base):
     content = Column(Text, nullable=False)
     status = Column(String, nullable=False, server_default="pending")  # pending/approved/rejected
     reject_reason = Column(String, nullable=True)
+    reply_to_id = Column(Integer, ForeignKey("public_chat_messages.id"), nullable=True)
+    is_pinned = Column(Boolean, nullable=False, server_default="false")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+    reply_to = relationship("PublicChatMessage", remote_side=[id])
+
+
+class PublicChatReaction(Base):
+    """Реакция (эмодзи) на сообщение общего чата — один пользователь может оставить только одну
+    реакцию на сообщение, повторный клик другим эмодзи заменяет её."""
+    __tablename__ = "public_chat_reactions"
+    __table_args__ = (UniqueConstraint("message_id", "user_id", name="uq_public_chat_reaction"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey("public_chat_messages.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    emoji = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     user = relationship("User")
