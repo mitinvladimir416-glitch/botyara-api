@@ -10,7 +10,7 @@
 
 import os
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Date, ForeignKey, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Date, Boolean, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.sql import func
 
@@ -51,6 +51,12 @@ class User(Base):
     current_streak = Column(Integer, nullable=False, server_default="0")
     last_active_date = Column(Date, nullable=True)
     last_seen_at = Column(DateTime(timezone=True), nullable=True)  # для "онлайн сейчас" в админке
+
+    # Модерация и роли — управляется через админ-панель (см. main.py: is_moderator/is_full_admin)
+    role = Column(String, nullable=False, server_default="user")  # "user" / "moderator" / "admin"
+    is_banned = Column(Boolean, nullable=False, server_default="false")
+    badge_text = Column(String, nullable=True)   # кастомное "украшение" — короткий титул рядом с именем
+    badge_color = Column(String, nullable=True)  # цвет титула (hex), задаётся админом
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
