@@ -150,13 +150,15 @@ class Announcement(Base):
 
 
 class GalleryLike(Base):
-    """Лайк на пост галереи — один пользователь может лайкнуть пост только один раз."""
+    """Реакция на пост галереи (эмодзи) — один пользователь может оставить только одну реакцию
+    на пост, повторный клик по другому эмодзи заменяет её."""
     __tablename__ = "gallery_likes"
     __table_args__ = (UniqueConstraint("post_id", "user_id", name="uq_gallery_like_post_user"),)
 
     id = Column(Integer, primary_key=True, index=True)
     post_id = Column(Integer, ForeignKey("gallery_posts.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    emoji = Column(String, nullable=False, server_default="❤️")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
