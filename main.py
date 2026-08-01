@@ -255,6 +255,7 @@ class RoomJoinRequest(BaseModel):
 
 class RoomMessageRequest(BaseModel):
     content: str
+    channel: str = "ai"  # "ai" — чат с нейросетью, "team" — приватное обсуждение участников
 
 
 class GalleryPublishRequest(BaseModel):
@@ -1727,6 +1728,7 @@ def serialize_room(db: Session, room: Room, current_user: User) -> dict:
             {
                 "id": m.id,
                 "content": m.content,
+                "channel": m.channel,
                 "author": author_display_name(m.user) if m.user else "🤖 Нейросеть",
                 "author_avatar": m.user.avatar_base64 if m.user else None,
                 "is_mine": m.user_id == current_user.id if m.user_id else False,
@@ -1806,21 +1808,35 @@ async def send_room_message(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Сообщение в комнате — сохраняется, и нейросеть сразу отвечает всем участникам."""
+    """
+    Сообщение в комнате. Два канала:
+    - "team" — приватное обсуждение между участниками, ИИ его не видит и не отвечает
+    - "ai" (по умолчанию) — общий чат с нейросетью, она сразу отвечает всем участникам
+    """
     room = get_room_or_404(db, code)
     require_room_participant(db, room, current_user)
 
     if room.status != "open":
         raise HTTPException(status_code=400, detail="Комната уже завершена")
 
-    db.add(RoomMessage(room_id=room.id, user_id=current_user.id, content=req.content))
+    channel = "team" if req.channel == "team" else "ai"
+    db.add(RoomMessage(room_id=room.id, user_id=current_user.id, channel=channel, content=req.content))
     db.commit()
-    add_xp(db, current_user, 2)
+    add_xp(db, current_user, 1 if channel == "team" else 2)
+
+    if channel == "team":
+        # Приватное обсуждение — просто сохраняем, нейросеть сюда не подключаем
+        return serialize_room(db, room, current_user)
 
     participants = db.query(RoomParticipant).filter(RoomParticipant.room_id == room.id).all()
     participant_names = [author_display_name(p.user) for p in participants]
 
-    history_rows = db.query(RoomMessage).filter(RoomMessage.room_id == room.id).order_by(RoomMessage.created_at.asc()).all()
+    history_rows = (
+        db.query(RoomMessage)
+        .filter(RoomMessage.room_id == room.id, RoomMessage.channel == "ai")
+        .order_by(RoomMessage.created_at.asc())
+        .all()
+    )
     history = [
         {
             "role": "assistant" if h.user_id is None else "user",
@@ -1830,7 +1846,7 @@ async def send_room_message(
     ]
 
     reply = ai_service.get_room_reply(room.category, participant_names, history)
-    db.add(RoomMessage(room_id=room.id, user_id=None, content=reply))
+    db.add(RoomMessage(room_id=room.id, user_id=None, channel="ai", content=reply))
     db.commit()
 
     return serialize_room(db, room, current_user)
@@ -1849,9 +1865,14 @@ async def finish_room(
     if room.status != "open":
         return serialize_room(db, room, current_user)
 
-    history_rows = db.query(RoomMessage).filter(RoomMessage.room_id == room.id).order_by(RoomMessage.created_at.asc()).all()
+    history_rows = (
+        db.query(RoomMessage)
+        .filter(RoomMessage.room_id == room.id, RoomMessage.channel == "ai")
+        .order_by(RoomMessage.created_at.asc())
+        .all()
+    )
     if not history_rows:
-        raise HTTPException(status_code=400, detail="В комнате пока нет ни одного сообщения")
+        raise HTTPException(status_code=400, detail="В чате с нейросетью пока нет ни одного сообщения")
 
     history = [
         {
