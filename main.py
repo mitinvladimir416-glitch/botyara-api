@@ -59,7 +59,40 @@ ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
 
 
 def is_site_admin(user: User) -> bool:
+    """Супер-админ — единственный, кто задан переменной окружения ADMIN_TELEGRAM_ID.
+    Только он может назначать/снимать роли модератора и админа у других — это защищает
+    от случайной "цепочки" самоназначений."""
     return bool(ADMIN_TELEGRAM_ID) and user.telegram_id == ADMIN_TELEGRAM_ID
+
+
+def get_effective_role(user: User) -> str:
+    """Супер-админ всегда 'admin', даже если в БД у него почему-то другая роль —
+    так аккаунт с ADMIN_TELEGRAM_ID никогда не может остаться без доступа."""
+    if is_site_admin(user):
+        return "admin"
+    return user.role or "user"
+
+
+def is_moderator(user: User) -> bool:
+    """Может модерировать контент (чистить чат/галерею) — модератор или админ."""
+    return get_effective_role(user) in ("moderator", "admin")
+
+
+def is_full_admin(user: User) -> bool:
+    """Полный админ — доступ к управлению аккаунтами пользователей, ролями, украшениями."""
+    return get_effective_role(user) == "admin"
+
+
+def ensure_not_banned(user: User) -> None:
+    if user.is_banned:
+        raise HTTPException(status_code=403, detail="Твой аккаунт ограничен модератором")
+
+
+def author_badge(user: User) -> dict | None:
+    """Кастомное 'украшение' — короткий титул с цветом, который админ выдал аккаунту вручную."""
+    if not user.badge_text:
+        return None
+    return {"text": user.badge_text, "color": user.badge_color or "#a78bfa"}
 
 
 # ==================== Геймификация: уровни, опыт, стрик, достижения ====================
@@ -253,6 +286,14 @@ class RoomJoinRequest(BaseModel):
     code: str
 
 
+class AdminUserUpdateRequest(BaseModel):
+    display_name: str | None = None
+    role: str | None = None  # "user" / "moderator" / "admin" — менять может только супер-админ
+    is_banned: bool | None = None
+    badge_text: str | None = None
+    badge_color: str | None = None
+
+
 class RoomMessageRequest(BaseModel):
     content: str
     channel: str = "ai"  # "ai" — чат с нейросетью, "team" — приватное обсуждение участников
@@ -326,9 +367,16 @@ def get_current_user(
 
 
 def require_admin(current_user: User = Depends(get_current_user)) -> User:
-    """Зависимость FastAPI: пускает только администратора сайта (см. is_site_admin)."""
-    if not is_site_admin(current_user):
+    """Зависимость FastAPI: пускает только полного администратора."""
+    if not is_full_admin(current_user):
         raise HTTPException(status_code=403, detail="Доступно только администратору")
+    return current_user
+
+
+def require_moderator(current_user: User = Depends(get_current_user)) -> User:
+    """Зависимость FastAPI: пускает модераторов и администраторов."""
+    if not is_moderator(current_user):
+        raise HTTPException(status_code=403, detail="Доступно только модератору")
     return current_user
 
 
@@ -722,7 +770,9 @@ async def get_me(current_user: User = Depends(get_current_user), db: Session = D
         "telegram_first_name": current_user.telegram_first_name,
         "display_name": current_user.display_name,
         "avatar_base64": current_user.avatar_base64,
-        "is_admin": is_site_admin(current_user),
+        "is_admin": is_full_admin(current_user),
+        "is_moderator": is_moderator(current_user),
+        "badge": author_badge(current_user),
         "xp": current_user.xp or 0,
         "level": level,
         "level_title": level_title(level),
@@ -901,6 +951,7 @@ async def gallery_publish(
     db: Session = Depends(get_db),
 ):
     """Публикует промпт из Избранного в общую галерею — проходит модерацию перед публикацией."""
+    ensure_not_banned(current_user)
     favorite = (
         db.query(Favorite)
         .filter(Favorite.id == req.favorite_id, Favorite.user_id == current_user.id)
@@ -965,6 +1016,7 @@ async def gallery_list(
                 "author": author_display_name(p.user),
                 "author_avatar": p.user.avatar_base64,
                 "author_level": calc_level(p.user.xp or 0),
+                "author_badge": author_badge(p.user),
                 "created_at": p.created_at,
                 "comment_count": comment_count,
                 "like_count": like_count,
@@ -1006,6 +1058,7 @@ async def gallery_detail(
         "author": author_display_name(post.user),
         "author_avatar": post.user.avatar_base64,
         "author_level": calc_level(post.user.xp or 0),
+        "author_badge": author_badge(post.user),
         "created_at": post.created_at,
         "is_mine": post.user_id == current_user.id,
         "like_count": like_count,
@@ -1017,6 +1070,7 @@ async def gallery_detail(
                 "author": author_display_name(c.user),
                 "author_avatar": c.user.avatar_base64,
                 "author_level": calc_level(c.user.xp or 0),
+                "author_badge": author_badge(c.user),
                 "created_at": c.created_at,
             }
             for c in comments
@@ -1032,6 +1086,7 @@ async def gallery_add_comment(
     db: Session = Depends(get_db),
 ):
     """Добавляет комментарий к посту — тоже проходит модерацию перед публикацией."""
+    ensure_not_banned(current_user)
     post = db.query(GalleryPost).filter(GalleryPost.id == post_id, GalleryPost.status == "approved").first()
     if not post:
         raise HTTPException(status_code=404, detail="Пост не найден")
@@ -1075,7 +1130,7 @@ async def gallery_delete(
 ):
     """Удаляет пост из галереи — свой, либо любой, если ты администратор."""
     query = db.query(GalleryPost).filter(GalleryPost.id == post_id)
-    if not is_site_admin(current_user):
+    if not is_moderator(current_user):
         query = query.filter(GalleryPost.user_id == current_user.id)
     post = query.first()
     if not post:
@@ -1094,7 +1149,7 @@ async def gallery_delete_comment(
 ):
     """Удаляет комментарий — свой, либо любой, если ты администратор."""
     query = db.query(GalleryComment).filter(GalleryComment.id == comment_id, GalleryComment.post_id == post_id)
-    if not is_site_admin(current_user):
+    if not is_moderator(current_user):
         query = query.filter(GalleryComment.user_id == current_user.id)
     comment = query.first()
     if not comment:
@@ -1243,6 +1298,7 @@ async def public_chat_list(
             "author": author_display_name(m.user),
             "author_avatar": m.user.avatar_base64,
             "author_level": calc_level(m.user.xp or 0),
+            "author_badge": author_badge(m.user),
             "created_at": m.created_at,
             "is_mine": m.user_id == current_user.id,
         }
@@ -1257,6 +1313,7 @@ async def public_chat_send(
     db: Session = Depends(get_db),
 ):
     """Отправляет сообщение в общий чат — проходит модерацию перед показом всем."""
+    ensure_not_banned(current_user)
     allowed, reason = ai_service.moderate_text(req.content)
     message = PublicChatMessage(
         user_id=current_user.id,
@@ -1279,11 +1336,11 @@ async def public_chat_delete(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Удаляет сообщение из общего чата — доступно автору сообщения или администратору."""
+    """Удаляет сообщение из общего чата — доступно автору сообщения, модератору или администратору."""
     message = db.query(PublicChatMessage).filter(PublicChatMessage.id == message_id).first()
     if not message:
         raise HTTPException(status_code=404, detail="Сообщение не найдено")
-    if message.user_id != current_user.id and not is_site_admin(current_user):
+    if message.user_id != current_user.id and not is_moderator(current_user):
         raise HTTPException(status_code=403, detail="Удалить можно только своё сообщение")
     db.delete(message)
     db.commit()
@@ -1295,9 +1352,9 @@ async def public_chat_clear(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Полностью очищает общий чат — только для администратора."""
-    if not is_site_admin(current_user):
-        raise HTTPException(status_code=403, detail="Только администратор может очистить общий чат")
+    """Полностью очищает общий чат — модератору или администратору."""
+    if not is_moderator(current_user):
+        raise HTTPException(status_code=403, detail="Только модератор может очистить общий чат")
     db.query(PublicChatMessage).delete()
     db.commit()
     return {"status": "cleared"}
@@ -1731,6 +1788,7 @@ def serialize_room(db: Session, room: Room, current_user: User) -> dict:
                 "name": author_display_name(p.user),
                 "avatar": p.user.avatar_base64,
                 "level": calc_level(p.user.xp or 0),
+                "badge": author_badge(p.user),
                 "is_me": p.user.id == current_user.id,
             }
             for p in participants
@@ -1946,3 +2004,88 @@ async def delete_room(
     db.delete(room)
     db.commit()
     return {"status": "deleted"}
+
+
+# ==================== Управление пользователями (только полный администратор) ====================
+
+def serialize_admin_user(u: User, viewer: User) -> dict:
+    return {
+        "id": u.id,
+        "name": author_display_name(u),
+        "avatar": u.avatar_base64,
+        "email": u.email,
+        "telegram_username": u.telegram_username,
+        "telegram_first_name": u.telegram_first_name,
+        "xp": u.xp or 0,
+        "level": calc_level(u.xp or 0),
+        "role": get_effective_role(u),
+        "is_banned": bool(u.is_banned),
+        "badge_text": u.badge_text,
+        "badge_color": u.badge_color,
+        "created_at": u.created_at,
+        "is_super_admin": is_site_admin(u),
+        # Роль может менять только супер-админ — фронт скрывает этот контрол для обычных админов
+        "can_manage_roles": is_site_admin(viewer),
+    }
+
+
+@app.get("/api/admin/users/search")
+async def admin_search_users(
+    q: str = "",
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Поиск пользователя по имени/email/Telegram — для управления аккаунтом."""
+    query = db.query(User)
+    if q.strip():
+        like = f"%{q.strip()}%"
+        query = query.filter(
+            (User.display_name.ilike(like))
+            | (User.email.ilike(like))
+            | (User.telegram_username.ilike(like))
+            | (User.telegram_first_name.ilike(like))
+        )
+    users = query.order_by(User.created_at.desc()).limit(30).all()
+    return [serialize_admin_user(u, current_user) for u in users]
+
+
+@app.patch("/api/admin/users/{user_id}")
+async def admin_update_user(
+    user_id: int,
+    req: AdminUserUpdateRequest,
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Изменяет аккаунт пользователя: имя, украшение (бейдж), бан, роль (роль — только супер-админ)."""
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+    if req.display_name is not None:
+        target.display_name = req.display_name.strip()[:50] or None
+
+    if req.badge_text is not None:
+        target.badge_text = req.badge_text.strip()[:30] or None
+
+    if req.badge_color is not None:
+        target.badge_color = req.badge_color.strip() or None
+        if target.badge_color:
+            notify(db, target, f"🎨 Тебе выдали украшение аккаунта: {target.badge_text or ''}")
+
+    if req.is_banned is not None:
+        if is_site_admin(target):
+            raise HTTPException(status_code=400, detail="Нельзя ограничить главного администратора")
+        target.is_banned = req.is_banned
+
+    if req.role is not None:
+        if not is_site_admin(current_user):
+            raise HTTPException(status_code=403, detail="Менять роли может только главный администратор")
+        if req.role not in ("user", "moderator", "admin"):
+            raise HTTPException(status_code=400, detail="Неизвестная роль")
+        if is_site_admin(target):
+            raise HTTPException(status_code=400, detail="Нельзя изменить роль главного администратора")
+        target.role = req.role
+        notify(db, target, f"🛡 Твоя роль на сайте изменена: {req.role}")
+
+    db.commit()
+    return serialize_admin_user(target, current_user)
