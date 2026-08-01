@@ -266,6 +266,11 @@ class BotAnnouncementRequest(BaseModel):
     content: str
 
 
+class AdminAnnouncementRequest(BaseModel):
+    content: str
+    ai_polish: bool = True
+
+
 class LinkEmailRequest(BaseModel):
     email: EmailStr
     password: str
@@ -301,6 +306,11 @@ class BotFavoriteRequest(BaseModel):
 class BotFavoriteDeleteRequest(BaseModel):
     telegram_id: int
     favorite_id: int
+
+
+class AdminAnnouncementRequest(BaseModel):
+    content: str
+    ai_polish: bool = True
 
 
 class RoomCreateRequest(BaseModel):
@@ -1340,9 +1350,31 @@ async def list_announcements(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Последние оповещения об обновлениях — публикует администратор через /announce в боте."""
+    """Последние оповещения об обновлениях — публикуются через /announce в боте или из админки сайта."""
     items = db.query(Announcement).order_by(Announcement.created_at.desc()).limit(20).all()
     return [{"id": a.id, "content": a.content, "created_at": a.created_at} for a in items]
+
+
+@app.post("/api/admin/announcements")
+async def admin_post_announcement(
+    req: AdminAnnouncementRequest,
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Публикует анонс обновления прямо с сайта (аналог /announce в боте) — виден только на сайте,
+    в Telegram не рассылается."""
+    text = req.content.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Пустой текст анонса")
+
+    if req.ai_polish:
+        text = ai_service.polish_announcement(text)
+
+    item = Announcement(content=text)
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {"id": item.id, "content": item.content, "created_at": item.created_at}
 
 
 @app.post("/api/bot/announcements", dependencies=[Depends(verify_bot_secret)])
