@@ -68,7 +68,7 @@ class Favorite(Base):
     __tablename__ = "favorites"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
     content = Column(Text, nullable=False)
     # category — папка: "suno" / "image" / "video" / "cover" / "other"
     category = Column(String, nullable=False, server_default="other")
@@ -81,7 +81,7 @@ class Message(Base):
     __tablename__ = "messages"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
     role = Column(String, nullable=False)      # "user" или "assistant"
     content = Column(Text, nullable=False)
     source = Column(String, nullable=False)    # "bot" или "web" — откуда пришло сообщение
@@ -99,7 +99,7 @@ class GalleryPost(Base):
     __tablename__ = "gallery_posts"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
     content = Column(Text, nullable=False)
     category = Column(String, nullable=False, server_default="other")
     status = Column(String, nullable=False, server_default="pending")  # pending/approved/rejected
@@ -115,8 +115,8 @@ class GalleryComment(Base):
     __tablename__ = "gallery_comments"
 
     id = Column(Integer, primary_key=True, index=True)
-    post_id = Column(Integer, ForeignKey("gallery_posts.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    post_id = Column(Integer, ForeignKey("gallery_posts.id"), index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
     content = Column(Text, nullable=False)
     status = Column(String, nullable=False, server_default="pending")
     reject_reason = Column(String, nullable=True)
@@ -131,11 +131,11 @@ class PublicChatMessage(Base):
     __tablename__ = "public_chat_messages"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
     content = Column(Text, nullable=False)
     status = Column(String, nullable=False, server_default="pending")  # pending/approved/rejected
     reject_reason = Column(String, nullable=True)
-    reply_to_id = Column(Integer, ForeignKey("public_chat_messages.id"), nullable=True)
+    reply_to_id = Column(Integer, ForeignKey("public_chat_messages.id"), index=True, nullable=True)
     is_pinned = Column(Boolean, nullable=False, server_default="false")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -150,8 +150,8 @@ class PublicChatReaction(Base):
     __table_args__ = (UniqueConstraint("message_id", "user_id", name="uq_public_chat_reaction"),)
 
     id = Column(Integer, primary_key=True, index=True)
-    message_id = Column(Integer, ForeignKey("public_chat_messages.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    message_id = Column(Integer, ForeignKey("public_chat_messages.id"), index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
     emoji = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -174,8 +174,8 @@ class GalleryLike(Base):
     __table_args__ = (UniqueConstraint("post_id", "user_id", name="uq_gallery_like_post_user"),)
 
     id = Column(Integer, primary_key=True, index=True)
-    post_id = Column(Integer, ForeignKey("gallery_posts.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    post_id = Column(Integer, ForeignKey("gallery_posts.id"), index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
     emoji = Column(String, nullable=False, server_default="❤️")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -186,7 +186,7 @@ class Notification(Base):
     __tablename__ = "notifications"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -197,7 +197,7 @@ class UserAchievement(Base):
     __table_args__ = (UniqueConstraint("user_id", "key", name="uq_user_achievement"),)
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
     key = Column(String, nullable=False)
     earned_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -210,7 +210,7 @@ class Room(Base):
     code = Column(String, unique=True, index=True, nullable=False)
     category = Column(String, nullable=False, server_default="other")  # suno/image/video/other
     status = Column(String, nullable=False, server_default="open")  # open/finished
-    created_by = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_by = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
     final_content = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -224,8 +224,8 @@ class RoomParticipant(Base):
     __table_args__ = (UniqueConstraint("room_id", "user_id", name="uq_room_participant"),)
 
     id = Column(Integer, primary_key=True, index=True)
-    room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    room_id = Column(Integer, ForeignKey("rooms.id"), index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
     joined_at = Column(DateTime(timezone=True), server_default=func.now())
 
     room = relationship("Room", back_populates="participants")
@@ -239,8 +239,8 @@ class RoomMessage(Base):
     __tablename__ = "room_messages"
 
     id = Column(Integer, primary_key=True, index=True)
-    room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # NULL — сообщение от ИИ
+    room_id = Column(Integer, ForeignKey("rooms.id"), index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=True)  # NULL — сообщение от ИИ
     channel = Column(String, nullable=False, server_default="ai")
     content = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
