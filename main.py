@@ -1187,6 +1187,17 @@ async def list_notifications(
     return [{"id": n.id, "content": n.content, "created_at": n.created_at} for n in items]
 
 
+@app.delete("/api/notifications")
+async def clear_notifications(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Полностью очищает личные уведомления текущего пользователя (лайки/комменты/достижения)."""
+    db.query(Notification).filter(Notification.user_id == current_user.id).delete()
+    db.commit()
+    return {"status": "cleared"}
+
+
 # ==================== Лента оповещений об обновлениях ====================
 
 @app.get("/api/announcements")
