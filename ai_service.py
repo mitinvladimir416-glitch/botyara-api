@@ -194,6 +194,29 @@ def get_room_final_prompt(category: str, history: list[dict]) -> str:
         return describe_groq_error(e)
 
 
+# ==================== Оповещения об обновлениях (публикация с сайта) ====================
+
+def polish_announcement(raw_notes: str) -> str:
+    """Превращает черновик-список изменений в живой, дружелюбный пост об обновлении.
+    Аналог того, что делает /announce в боте, но вызывается с сайта."""
+    system_prompt = (
+        "Ты — автор дружелюбных, живых постов об обновлениях сайта и Telegram-бота «Ботяра». "
+        "Тебе присылают список изменений (может быть сухим и коротким) — твоя задача оформить его "
+        "в приятный, читаемый пост: без канцелярита, коротко и по делу, с уместными эмодзи, но не "
+        "перегружая ими. Не выдумывай изменения, которых не было в исходном списке — только оформи "
+        "то, что дали. Ответь ТОЛЬКО готовым текстом поста, без пояснений вокруг."
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": raw_notes},
+    ]
+    try:
+        return chat_completion_with_fallback(messages, temperature=0.8, max_tokens=500)
+    except Exception as e:
+        logging.exception("Ошибка при оформлении анонса")
+        return raw_notes  # если нейросеть недоступна — публикуем как есть, а не роняем всё
+
+
 SYSTEM_PROMPT = "Ты дружелюбный ассистент, отвечай кратко и по делу на русском языке."
 
 # ==================== РОЛИ ДЛЯ РАЗДЕЛА "ОБЩЕНИЕ" ====================
@@ -444,6 +467,73 @@ def get_prompt_reply(topic: str, target: str | None, history: list[dict]) -> str
         return clean_reply(response.choices[0].message.content)
     except Exception as e:
         logging.exception("Ошибка при составлении промпта")
+        return describe_groq_error(e)
+
+
+def improve_prompt(topic: str, target: str | None, draft: str) -> str:
+    """
+    "Прокачай мой промпт" — берёт уже написанный пользователем черновик и доводит его до
+    качественного, детального промпта под нужную нейросеть, сохраняя авторскую идею.
+    """
+    config = PROMPT_CONFIG.get(topic)
+    base_system = config["system_prompt"] if config else (
+        "Ты — эксперт по составлению промптов для генеративных нейросетей."
+    )
+    target_note = f" под {target}" if target else ""
+    system_content = (
+        base_system
+        + f"\n\nПользователь уже написал черновик промпта{target_note} — он ниже. Твоя задача: "
+        "УЛУЧШИТЬ его, а не придумать заново — сохрани исходную идею и намерение автора, но сделай "
+        "текст более качественным, детальным и эффективным (добавь недостающие важные детали — стиль, "
+        "освещение/настроение/структуру и т.д., в зависимости от темы). Не задавай уточняющих вопросов — "
+        "сразу выдай улучшенный результат. Обязательно начни строго со строки 'ГОТОВЫЙ ПРОМПТ:' на "
+        "отдельной строке, дальше сам улучшенный промпт."
+    )
+    messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": draft},
+    ]
+    try:
+        response = groq_client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0.7,
+            max_tokens=1500,
+        )
+        return clean_reply(response.choices[0].message.content)
+    except Exception as e:
+        logging.exception("Ошибка при улучшении промпта")
+        return describe_groq_error(e)
+
+
+ANNOUNCE_SYSTEM_PROMPT = (
+    "Ты — автор дружелюбных, живых постов об обновлениях сервиса «Ботяра» (сайт + Telegram-бот: "
+    "общение с ролями, промпты для музыки/картинок/видео, галерея, совместные комнаты и т.д.). "
+    "Стиль — неформальный, с юмором, на \"ты\", уместные эмодзи, без канцелярита и воды.\n\n"
+    "Тебе дают список того, что изменилось (иногда сухими фразами или просто списком) — "
+    "превращай это в один цельный, воодушевляющий пост для ленты обновлений на сайте.\n\n"
+    "Правила:\n"
+    "- НЕ используй HTML/Markdown-разметку — пиши только простым текстом.\n"
+    "- Используй эмодзи по смыслу, но не перегружай.\n"
+    "- Короткие абзацы, разделяй их пустой строкой.\n"
+    "- Ответь только готовым текстом поста, без пояснений от себя."
+)
+
+
+def polish_announcement(raw_notes: str) -> str:
+    """Оформляет черновик анонса в красивый пост для ленты обновлений (используется в админке сайта)."""
+    try:
+        raw = chat_completion_with_fallback(
+            [
+                {"role": "system", "content": ANNOUNCE_SYSTEM_PROMPT},
+                {"role": "user", "content": raw_notes},
+            ],
+            temperature=0.8,
+            max_tokens=800,
+        )
+        return clean_reply(raw)
+    except Exception as e:
+        logging.exception("Ошибка при оформлении анонса")
         return describe_groq_error(e)
 
 
