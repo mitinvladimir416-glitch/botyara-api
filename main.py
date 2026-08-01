@@ -19,11 +19,12 @@ import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import func as sa_func
 
 import ai_service
 import auth
@@ -101,6 +102,15 @@ def check_rate_limit(key: str, max_calls: int, window_seconds: float) -> None:
     if len(calls) >= max_calls:
         raise HTTPException(status_code=429, detail="Слишком часто — подожди немного и попробуй снова")
     calls.append(now)
+
+
+def client_ip(request: Request) -> str:
+    """IP клиента — для лимитов на эндпоинтах без авторизации (вход/регистрация),
+    где нет current_user.id, чтобы ограничивать по нему."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 
 def author_badge(user: User) -> dict | None:
@@ -716,8 +726,9 @@ async def cover(req: CoverRequest):
 # ==================== Авторизация ====================
 
 @app.post("/api/auth/register")
-async def register(req: RegisterRequest, db: Session = Depends(get_db)):
+async def register(req: RegisterRequest, request: Request, db: Session = Depends(get_db)):
     """Регистрация по email и паролю."""
+    check_rate_limit(f"register:{client_ip(request)}", max_calls=5, window_seconds=300)
     existing = db.query(User).filter(User.email == req.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Пользователь с таким email уже зарегистрирован")
@@ -732,8 +743,9 @@ async def register(req: RegisterRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/login")
-async def login(req: LoginRequest, db: Session = Depends(get_db)):
+async def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
     """Вход по email и паролю."""
+    check_rate_limit(f"login:{client_ip(request)}", max_calls=10, window_seconds=300)
     user = db.query(User).filter(User.email == req.email).first()
     if not user or not user.password_hash or not auth.verify_password(req.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Неверный email или пароль")
@@ -761,16 +773,18 @@ class BotTelegramAuthConfirmRequest(BaseModel):
 
 
 @app.post("/api/auth/telegram/start")
-async def telegram_login_start():
+async def telegram_login_start(request: Request):
     """Генерирует одноразовый токен для входа через бота — сайт покажет ссылку и начнёт опрос."""
+    check_rate_limit(f"tg_login_start:{client_ip(request)}", max_calls=10, window_seconds=300)
     token = secrets.token_urlsafe(24)
     pending_telegram_logins[token] = {"status": "pending", "created_at": time.time()}
     return {"token": token, "bot_username": BOT_USERNAME}
 
 
 @app.get("/api/auth/telegram/poll")
-async def telegram_login_poll(token: str, db: Session = Depends(get_db)):
+async def telegram_login_poll(token: str, request: Request, db: Session = Depends(get_db)):
     """Сайт опрашивает это раз в пару секунд, пока пользователь не подтвердит вход через бота."""
+    check_rate_limit(f"tg_login_poll:{client_ip(request)}", max_calls=200, window_seconds=300)
     entry = pending_telegram_logins.get(token)
     if not entry:
         raise HTTPException(status_code=404, detail="Токен не найден или уже использован")
@@ -904,6 +918,7 @@ async def change_password(
     db: Session = Depends(get_db),
 ):
     """Меняет пароль уже привязанного email. Требует ввести текущий пароль для подтверждения."""
+    check_rate_limit(f"change_password:{current_user.id}", max_calls=10, window_seconds=300)
     if not current_user.password_hash:
         raise HTTPException(
             status_code=400, detail="У аккаунта ещё нет пароля — сначала привяжи email в разделе Аккаунт"
@@ -1059,21 +1074,32 @@ async def gallery_list(
     query = db.query(GalleryPost).filter(GalleryPost.status == "approved")
     if q.strip():
         query = query.filter(GalleryPost.content.ilike(f"%{q.strip()}%"))
-    posts = query.order_by(GalleryPost.created_at.desc()).limit(50).all()
+    posts = (
+        query.options(joinedload(GalleryPost.user))
+        .order_by(GalleryPost.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    post_ids = [p.id for p in posts]
+
+    comment_counts = {}
+    reactions_by_post = {}
+    my_reaction_by_post = {}
+    if post_ids:
+        comment_counts = dict(
+            db.query(GalleryComment.post_id, sa_func.count(GalleryComment.id))
+            .filter(GalleryComment.post_id.in_(post_ids), GalleryComment.status == "approved")
+            .group_by(GalleryComment.post_id)
+            .all()
+        )
+        for r in db.query(GalleryLike).filter(GalleryLike.post_id.in_(post_ids)).all():
+            bucket = reactions_by_post.setdefault(r.post_id, {})
+            bucket[r.emoji] = bucket.get(r.emoji, 0) + 1
+            if r.user_id == current_user.id:
+                my_reaction_by_post[r.post_id] = r.emoji
+
     result = []
     for p in posts:
-        comment_count = (
-            db.query(GalleryComment)
-            .filter(GalleryComment.post_id == p.id, GalleryComment.status == "approved")
-            .count()
-        )
-        reaction_rows = db.query(GalleryLike).filter(GalleryLike.post_id == p.id).all()
-        reactions = {}
-        my_reaction = None
-        for r in reaction_rows:
-            reactions[r.emoji] = reactions.get(r.emoji, 0) + 1
-            if r.user_id == current_user.id:
-                my_reaction = r.emoji
         result.append(
             {
                 "id": p.id,
@@ -1085,9 +1111,9 @@ async def gallery_list(
                 "author_level": calc_level(p.user.xp or 0),
                 "author_badge": author_badge(p.user),
                 "created_at": p.created_at,
-                "comment_count": comment_count,
-                "reactions": reactions,
-                "my_reaction": my_reaction,
+                "comment_count": comment_counts.get(p.id, 0),
+                "reactions": reactions_by_post.get(p.id, {}),
+                "my_reaction": my_reaction_by_post.get(p.id),
                 "is_mine": p.user_id == current_user.id,
             }
         )
@@ -1434,6 +1460,69 @@ def serialize_public_message(db: Session, m: PublicChatMessage, current_user: Us
     }
 
 
+def serialize_public_messages_batch(db: Session, messages: list, current_user: User) -> list:
+    """Как serialize_public_message, но для СПИСКА сообщений разом — считает реакции и подгружает
+    оригиналы ответов одним запросом на всех, а не по одному на каждое сообщение (N+1)."""
+    if not messages:
+        return []
+    message_ids = [m.id for m in messages]
+
+    reaction_rows = db.query(PublicChatReaction).filter(PublicChatReaction.message_id.in_(message_ids)).all()
+    reactor_ids = {r.user_id for r in reaction_rows}
+    reactor_users = {}
+    if reactor_ids:
+        reactor_users = {u.id: u for u in db.query(User).filter(User.id.in_(reactor_ids)).all()}
+
+    reactions_by_msg = {}
+    reactors_by_msg = {}
+    my_reaction_by_msg = {}
+    for r in reaction_rows:
+        bucket = reactions_by_msg.setdefault(r.message_id, {})
+        bucket[r.emoji] = bucket.get(r.emoji, 0) + 1
+        reactor_name = author_display_name(reactor_users[r.user_id]) if r.user_id in reactor_users else "?"
+        reactors_by_msg.setdefault(r.message_id, {}).setdefault(r.emoji, []).append(reactor_name)
+        if r.user_id == current_user.id:
+            my_reaction_by_msg[r.message_id] = r.emoji
+
+    reply_ids = {m.reply_to_id for m in messages if m.reply_to_id}
+    reply_originals = {}
+    if reply_ids:
+        originals = (
+            db.query(PublicChatMessage)
+            .options(joinedload(PublicChatMessage.user))
+            .filter(PublicChatMessage.id.in_(reply_ids))
+            .all()
+        )
+        reply_originals = {o.id: o for o in originals}
+
+    result = []
+    for m in messages:
+        reply_to = None
+        if m.reply_to_id and m.reply_to_id in reply_originals:
+            orig = reply_originals[m.reply_to_id]
+            snippet = orig.content[:80] + ("…" if len(orig.content) > 80 else "")
+            reply_to = {"id": orig.id, "author": author_display_name(orig.user), "content": snippet}
+        result.append(
+            {
+                "id": m.id,
+                "content": m.content,
+                "author": author_display_name(m.user),
+                "author_id": m.user.id,
+                "author_avatar": m.user.avatar_base64,
+                "author_level": calc_level(m.user.xp or 0),
+                "author_badge": author_badge(m.user),
+                "created_at": m.created_at,
+                "is_mine": m.user_id == current_user.id,
+                "is_pinned": m.is_pinned,
+                "reply_to": reply_to,
+                "reactions": reactions_by_msg.get(m.id, {}),
+                "reactors": reactors_by_msg.get(m.id, {}),
+                "my_reaction": my_reaction_by_msg.get(m.id),
+            }
+        )
+    return result
+
+
 @app.get("/api/public-chat")
 async def public_chat_list(
     current_user: User = Depends(get_current_user),
@@ -1442,6 +1531,7 @@ async def public_chat_list(
     """Последние 50 одобренных сообщений общего чата, от старых к новым, плюс закреплённое."""
     messages = (
         db.query(PublicChatMessage)
+        .options(joinedload(PublicChatMessage.user))
         .filter(PublicChatMessage.status == "approved")
         .order_by(PublicChatMessage.created_at.desc())
         .limit(50)
@@ -1451,9 +1541,15 @@ async def public_chat_list(
 
     pinned = db.query(PublicChatMessage).filter(PublicChatMessage.is_pinned == True).first()  # noqa: E712
 
+    # Закреплённое сообщение может не входить в последние 50 — сериализуем отдельным батчем при надобности
+    to_serialize = list(messages)
+    if pinned and pinned.id not in {m.id for m in messages}:
+        to_serialize.append(pinned)
+    serialized = {s["id"]: s for s in serialize_public_messages_batch(db, to_serialize, current_user)}
+
     return {
-        "messages": [serialize_public_message(db, m, current_user) for m in messages],
-        "pinned": serialize_public_message(db, pinned, current_user) if pinned else None,
+        "messages": [serialized[m.id] for m in messages],
+        "pinned": serialized[pinned.id] if pinned else None,
     }
 
 
@@ -1518,7 +1614,7 @@ async def public_chat_context(
     )
     window = list(reversed(before)) + [target] + after
     return {
-        "messages": [serialize_public_message(db, m, current_user) for m in window],
+        "messages": serialize_public_messages_batch(db, window, current_user),
         "target_id": target.id,
     }
 
