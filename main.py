@@ -1133,6 +1133,7 @@ async def gallery_detail(
 
     comments = (
         db.query(GalleryComment)
+        .options(joinedload(GalleryComment.user))
         .filter(GalleryComment.post_id == post_id, GalleryComment.status == "approved")
         .order_by(GalleryComment.created_at.asc())
         .all()
@@ -2075,7 +2076,13 @@ async def admin_activity(current_user: User = Depends(require_admin), db: Sessio
     """Лента последних событий (посты, комментарии, сообщения общего чата) — быстрый обзор модерации."""
     events = []
 
-    for p in db.query(GalleryPost).order_by(GalleryPost.created_at.desc()).limit(20).all():
+    for p in (
+        db.query(GalleryPost)
+        .options(joinedload(GalleryPost.user))
+        .order_by(GalleryPost.created_at.desc())
+        .limit(20)
+        .all()
+    ):
         preview = p.content[:100] + ("…" if len(p.content) > 100 else "")
         events.append(
             {
@@ -2088,7 +2095,13 @@ async def admin_activity(current_user: User = Depends(require_admin), db: Sessio
             }
         )
 
-    for c in db.query(GalleryComment).order_by(GalleryComment.created_at.desc()).limit(20).all():
+    for c in (
+        db.query(GalleryComment)
+        .options(joinedload(GalleryComment.user))
+        .order_by(GalleryComment.created_at.desc())
+        .limit(20)
+        .all()
+    ):
         preview = c.content[:100] + ("…" if len(c.content) > 100 else "")
         events.append(
             {
@@ -2101,7 +2114,13 @@ async def admin_activity(current_user: User = Depends(require_admin), db: Sessio
             }
         )
 
-    for m in db.query(PublicChatMessage).order_by(PublicChatMessage.created_at.desc()).limit(20).all():
+    for m in (
+        db.query(PublicChatMessage)
+        .options(joinedload(PublicChatMessage.user))
+        .order_by(PublicChatMessage.created_at.desc())
+        .limit(20)
+        .all()
+    ):
         preview = m.content[:100] + ("…" if len(m.content) > 100 else "")
         events.append(
             {
@@ -2151,8 +2170,19 @@ def require_room_participant(db: Session, room: Room, user: User) -> None:
 
 
 def serialize_room(db: Session, room: Room, current_user: User) -> dict:
-    participants = db.query(RoomParticipant).filter(RoomParticipant.room_id == room.id).all()
-    messages = db.query(RoomMessage).filter(RoomMessage.room_id == room.id).order_by(RoomMessage.created_at.asc()).all()
+    participants = (
+        db.query(RoomParticipant)
+        .options(joinedload(RoomParticipant.user))
+        .filter(RoomParticipant.room_id == room.id)
+        .all()
+    )
+    messages = (
+        db.query(RoomMessage)
+        .options(joinedload(RoomMessage.user))
+        .filter(RoomMessage.room_id == room.id)
+        .order_by(RoomMessage.created_at.asc())
+        .all()
+    )
 
     now = time.time()
     typing_state = room_typing_state.get(room.code, {})
