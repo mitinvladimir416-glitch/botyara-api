@@ -43,6 +43,7 @@ from database import (
     Room,
     RoomParticipant,
     RoomMessage,
+    PublicChatReaction,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -364,6 +365,11 @@ class BotGalleryCommentRequest(BaseModel):
 
 class PublicChatRequest(BaseModel):
     content: str
+    reply_to_id: int | None = None
+
+
+class PublicChatReactRequest(BaseModel):
+    emoji: str
 
 
 class BotPublicChatRequest(BaseModel):
@@ -1389,12 +1395,51 @@ async def bot_save_announcement(req: BotAnnouncementRequest, db: Session = Depen
 
 # ==================== Общий публичный чат (требует авторизации сайта) ====================
 
+PUBLIC_CHAT_REACTIONS = ["❤️", "🔥", "😂", "👍", "😮"]
+
+
+def serialize_public_message(db: Session, m: PublicChatMessage, current_user: User) -> dict:
+    reaction_rows = db.query(PublicChatReaction).filter(PublicChatReaction.message_id == m.id).all()
+    reactions = {}
+    my_reaction = None
+    reactors = {}
+    for r in reaction_rows:
+        reactions[r.emoji] = reactions.get(r.emoji, 0) + 1
+        reactors.setdefault(r.emoji, []).append(author_display_name(r.user))
+        if r.user_id == current_user.id:
+            my_reaction = r.emoji
+
+    reply_to = None
+    if m.reply_to_id:
+        original = db.query(PublicChatMessage).filter(PublicChatMessage.id == m.reply_to_id).first()
+        if original:
+            snippet = original.content[:80] + ("…" if len(original.content) > 80 else "")
+            reply_to = {"id": original.id, "author": author_display_name(original.user), "content": snippet}
+
+    return {
+        "id": m.id,
+        "content": m.content,
+        "author": author_display_name(m.user),
+        "author_id": m.user.id,
+        "author_avatar": m.user.avatar_base64,
+        "author_level": calc_level(m.user.xp or 0),
+        "author_badge": author_badge(m.user),
+        "created_at": m.created_at,
+        "is_mine": m.user_id == current_user.id,
+        "is_pinned": m.is_pinned,
+        "reply_to": reply_to,
+        "reactions": reactions,
+        "reactors": reactors,
+        "my_reaction": my_reaction,
+    }
+
+
 @app.get("/api/public-chat")
 async def public_chat_list(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Последние 50 одобренных сообщений общего чата, от старых к новым."""
+    """Последние 50 одобренных сообщений общего чата, от старых к новым, плюс закреплённое."""
     messages = (
         db.query(PublicChatMessage)
         .filter(PublicChatMessage.status == "approved")
@@ -1403,20 +1448,79 @@ async def public_chat_list(
         .all()
     )
     messages.reverse()
+
+    pinned = db.query(PublicChatMessage).filter(PublicChatMessage.is_pinned == True).first()  # noqa: E712
+
+    return {
+        "messages": [serialize_public_message(db, m, current_user) for m in messages],
+        "pinned": serialize_public_message(db, pinned, current_user) if pinned else None,
+    }
+
+
+@app.get("/api/public-chat/search")
+async def public_chat_search(
+    q: str = "",
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Поиск по тексту или автору — быстрый обзор совпадений, без загрузки всей истории."""
+    if not q.strip():
+        return []
+    like = f"%{q.strip()}%"
+    rows = (
+        db.query(PublicChatMessage)
+        .join(User, PublicChatMessage.user_id == User.id)
+        .filter(
+            PublicChatMessage.status == "approved",
+            (PublicChatMessage.content.ilike(like))
+            | (User.display_name.ilike(like))
+            | (User.telegram_first_name.ilike(like)),
+        )
+        .order_by(PublicChatMessage.created_at.desc())
+        .limit(30)
+        .all()
+    )
     return [
         {
             "id": m.id,
-            "content": m.content,
+            "content": m.content[:120] + ("…" if len(m.content) > 120 else ""),
             "author": author_display_name(m.user),
-            "author_id": m.user.id,
-            "author_avatar": m.user.avatar_base64,
-            "author_level": calc_level(m.user.xp or 0),
-            "author_badge": author_badge(m.user),
             "created_at": m.created_at,
-            "is_mine": m.user_id == current_user.id,
         }
-        for m in messages
+        for m in rows
     ]
+
+
+@app.get("/api/public-chat/context/{message_id}")
+async def public_chat_context(
+    message_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Окно сообщений вокруг конкретного (для перехода 'к оригиналу' из ответа/поиска)."""
+    target = db.query(PublicChatMessage).filter(PublicChatMessage.id == message_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Сообщение не найдено")
+
+    before = (
+        db.query(PublicChatMessage)
+        .filter(PublicChatMessage.status == "approved", PublicChatMessage.created_at < target.created_at)
+        .order_by(PublicChatMessage.created_at.desc())
+        .limit(15)
+        .all()
+    )
+    after = (
+        db.query(PublicChatMessage)
+        .filter(PublicChatMessage.status == "approved", PublicChatMessage.created_at > target.created_at)
+        .order_by(PublicChatMessage.created_at.asc())
+        .limit(15)
+        .all()
+    )
+    window = list(reversed(before)) + [target] + after
+    return {
+        "messages": [serialize_public_message(db, m, current_user) for m in window],
+        "target_id": target.id,
+    }
 
 
 @app.post("/api/public-chat")
@@ -1429,11 +1533,19 @@ async def public_chat_send(
     ensure_not_banned(current_user)
     check_rate_limit(f"public_chat:{current_user.id}", max_calls=10, window_seconds=30)
     allowed, reason = ai_service.moderate_text(req.content)
+
+    reply_to_id = None
+    if req.reply_to_id:
+        original = db.query(PublicChatMessage).filter(PublicChatMessage.id == req.reply_to_id).first()
+        if original:
+            reply_to_id = original.id
+
     message = PublicChatMessage(
         user_id=current_user.id,
         content=req.content,
         status="approved" if allowed else "rejected",
         reject_reason=None if allowed else reason,
+        reply_to_id=reply_to_id,
     )
     db.add(message)
     db.commit()
@@ -1472,6 +1584,57 @@ async def public_chat_clear(
     db.query(PublicChatMessage).delete()
     db.commit()
     return {"status": "cleared"}
+
+
+@app.post("/api/public-chat/{message_id}/react")
+async def public_chat_react(
+    message_id: int,
+    req: PublicChatReactRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Реакция на сообщение — один эмодзи на пользователя, повторный клик убирает/меняет."""
+    if req.emoji not in PUBLIC_CHAT_REACTIONS:
+        raise HTTPException(status_code=400, detail="Неизвестная реакция")
+    message = db.query(PublicChatMessage).filter(PublicChatMessage.id == message_id).first()
+    if not message:
+        raise HTTPException(status_code=404, detail="Сообщение не найдено")
+
+    existing = (
+        db.query(PublicChatReaction)
+        .filter(PublicChatReaction.message_id == message_id, PublicChatReaction.user_id == current_user.id)
+        .first()
+    )
+    if existing and existing.emoji == req.emoji:
+        db.delete(existing)
+    elif existing:
+        existing.emoji = req.emoji
+    else:
+        db.add(PublicChatReaction(message_id=message_id, user_id=current_user.id, emoji=req.emoji))
+    db.commit()
+
+    return serialize_public_message(db, message, current_user)
+
+
+@app.post("/api/public-chat/{message_id}/pin")
+async def public_chat_pin(
+    message_id: int,
+    current_user: User = Depends(require_moderator),
+    db: Session = Depends(get_db),
+):
+    """Закрепляет сообщение (снимая предыдущий закреп) — только модератор/админ. Повторный клик снимает."""
+    message = db.query(PublicChatMessage).filter(PublicChatMessage.id == message_id).first()
+    if not message:
+        raise HTTPException(status_code=404, detail="Сообщение не найдено")
+
+    if message.is_pinned:
+        message.is_pinned = False
+    else:
+        db.query(PublicChatMessage).filter(PublicChatMessage.is_pinned == True).update({"is_pinned": False})  # noqa: E712
+        message.is_pinned = True
+    db.commit()
+
+    return serialize_public_message(db, message, current_user)
 
 
 # ==================== Эндпоинты для бота (требуют секрет BOT_INTERNAL_SECRET) ====================
