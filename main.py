@@ -1916,6 +1916,22 @@ async def list_my_rooms(
             "category": r.room.category,
             "status": r.room.status,
             "created_at": r.room.created_at,
+            "is_owner": r.room.created_by == current_user.id,
         }
         for r in rows
     ]
+
+
+@app.delete("/api/rooms/{code}")
+async def delete_room(
+    code: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Удаляет комнату целиком (вместе со всеми сообщениями) — доступно создателю или администратору."""
+    room = get_room_or_404(db, code)
+    if room.created_by != current_user.id and not is_site_admin(current_user):
+        raise HTTPException(status_code=403, detail="Удалить комнату может только её создатель")
+    db.delete(room)
+    db.commit()
+    return {"status": "deleted"}
