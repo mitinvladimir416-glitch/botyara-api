@@ -19,7 +19,7 @@ import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -1425,6 +1425,79 @@ async def bot_save_announcement(req: BotAnnouncementRequest, db: Session = Depen
 PUBLIC_CHAT_REACTIONS = ["❤️", "🔥", "😂", "👍", "😮"]
 
 
+# ==================== WebSocket общего чата — мгновенная доставка ====================
+# Сама отправка/модерация/лимиты остаются на REST (/api/public-chat) — WebSocket только
+# оповещает уже подключённых клиентов, что что-то произошло, без дублирования логики.
+
+class ChatConnectionManager:
+    def __init__(self):
+        self.active: list[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        if ws in self.active:
+            self.active.remove(ws)
+
+    async def broadcast(self, data: dict):
+        dead = []
+        for ws in self.active:
+            try:
+                await ws.send_json(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(ws)
+
+
+chat_manager = ChatConnectionManager()
+
+
+def serialize_public_message_public(db: Session, m: PublicChatMessage) -> dict:
+    """Версия сообщения БЕЗ привязки к конкретному зрителю (без is_mine/my_reaction) —
+    именно её рассылаем всем через WebSocket, т.к. эти поля у каждого свои."""
+    reply_to = None
+    if m.reply_to_id:
+        original = db.query(PublicChatMessage).filter(PublicChatMessage.id == m.reply_to_id).first()
+        if original:
+            snippet = original.content[:80] + ("…" if len(original.content) > 80 else "")
+            reply_to = {"id": original.id, "author": author_display_name(original.user), "content": snippet}
+    return {
+        "id": m.id,
+        "content": m.content,
+        "author": author_display_name(m.user),
+        "author_id": m.user.id,
+        "author_avatar": m.user.avatar_base64,
+        "author_level": calc_level(m.user.xp or 0),
+        "author_badge": author_badge(m.user),
+        "created_at": m.created_at.isoformat() if m.created_at else None,
+        "is_pinned": m.is_pinned,
+        "reply_to": reply_to,
+        "reactions": {},
+        "reactors": {},
+    }
+
+
+@app.websocket("/ws/public-chat")
+async def public_chat_ws(websocket: WebSocket, token: str | None = None):
+    """Держит соединение открытым и присылает событие всем, у кого открыт чат, как только что-то
+    меняется — сайт реагирует мгновенно, вместо ожидания следующего опроса."""
+    if not token or not auth.decode_access_token(token):
+        await websocket.close(code=4001)
+        return
+    await chat_manager.connect(websocket)
+    try:
+        while True:
+            # Клиент ничего осмысленного не шлёт — просто держим соединение живым
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        chat_manager.disconnect(websocket)
+    except Exception:
+        chat_manager.disconnect(websocket)
+
+
 def serialize_public_message(db: Session, m: PublicChatMessage, current_user: User) -> dict:
     reaction_rows = db.query(PublicChatReaction).filter(PublicChatReaction.message_id == m.id).all()
     reactions = {}
@@ -1650,6 +1723,7 @@ async def public_chat_send(
 
     if allowed:
         add_xp(db, current_user, 2)
+        await chat_manager.broadcast({"type": "new_message", "message": serialize_public_message_public(db, message)})
     return {"id": message.id, "status": message.status, "reject_reason": message.reject_reason}
 
 
@@ -1667,6 +1741,7 @@ async def public_chat_delete(
         raise HTTPException(status_code=403, detail="Удалить можно только своё сообщение")
     db.delete(message)
     db.commit()
+    await chat_manager.broadcast({"type": "refresh"})
     return {"status": "deleted"}
 
 
@@ -1680,6 +1755,7 @@ async def public_chat_clear(
         raise HTTPException(status_code=403, detail="Только модератор может очистить общий чат")
     db.query(PublicChatMessage).delete()
     db.commit()
+    await chat_manager.broadcast({"type": "refresh"})
     return {"status": "cleared"}
 
 
@@ -1709,6 +1785,7 @@ async def public_chat_react(
     else:
         db.add(PublicChatReaction(message_id=message_id, user_id=current_user.id, emoji=req.emoji))
     db.commit()
+    await chat_manager.broadcast({"type": "refresh"})
 
     return serialize_public_message(db, message, current_user)
 
@@ -1730,6 +1807,7 @@ async def public_chat_pin(
         db.query(PublicChatMessage).filter(PublicChatMessage.is_pinned == True).update({"is_pinned": False})  # noqa: E712
         message.is_pinned = True
     db.commit()
+    await chat_manager.broadcast({"type": "refresh"})
 
     return serialize_public_message(db, message, current_user)
 
