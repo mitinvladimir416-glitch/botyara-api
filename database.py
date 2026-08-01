@@ -207,12 +207,15 @@ class RoomParticipant(Base):
 
 
 class RoomMessage(Base):
-    """Сообщение в совместной комнате — от участника или от нейросети (user_id=NULL)."""
+    """Сообщение в совместной комнате — от участника или от нейросети (user_id=NULL).
+    channel: "ai" — общий чат с нейросетью (виден и влияет на итоговый промпт),
+             "team" — приватное обсуждение только между участниками, ИИ его не видит."""
     __tablename__ = "room_messages"
 
     id = Column(Integer, primary_key=True, index=True)
     room_id = Column(Integer, ForeignKey("rooms.id"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # NULL — сообщение от ИИ
+    channel = Column(String, nullable=False, server_default="ai")
     content = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
