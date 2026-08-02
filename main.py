@@ -10,6 +10,7 @@ API-сервер для сайта botyara.ru.
 из requirements.txt + Procfile/настроек — см. README.md.
 """
 
+import asyncio
 import base64
 import logging
 import math
@@ -1442,14 +1443,20 @@ class ChatConnectionManager:
             self.active.remove(ws)
 
     async def broadcast(self, data: dict):
-        dead = []
-        for ws in self.active:
+        if not self.active:
+            return
+
+        async def send_one(ws: WebSocket):
             try:
                 await ws.send_json(data)
+                return None
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
+                return ws
+
+        results = await asyncio.gather(*(send_one(ws) for ws in self.active), return_exceptions=False)
+        for dead_ws in results:
+            if dead_ws is not None:
+                self.disconnect(dead_ws)
 
 
 chat_manager = ChatConnectionManager()
@@ -1724,7 +1731,13 @@ async def public_chat_send(
     if allowed:
         add_xp(db, current_user, 2)
         await chat_manager.broadcast({"type": "new_message", "message": serialize_public_message_public(db, message)})
-    return {"id": message.id, "status": message.status, "reject_reason": message.reject_reason}
+        return {
+            "id": message.id,
+            "status": message.status,
+            "reject_reason": message.reject_reason,
+            "message": serialize_public_message(db, message, current_user),
+        }
+    return {"id": message.id, "status": message.status, "reject_reason": message.reject_reason, "message": None}
 
 
 @app.delete("/api/public-chat/{message_id}")
@@ -1741,7 +1754,7 @@ async def public_chat_delete(
         raise HTTPException(status_code=403, detail="Удалить можно только своё сообщение")
     db.delete(message)
     db.commit()
-    await chat_manager.broadcast({"type": "refresh"})
+    await chat_manager.broadcast({"type": "message_deleted", "id": message_id})
     return {"status": "deleted"}
 
 
@@ -1755,7 +1768,7 @@ async def public_chat_clear(
         raise HTTPException(status_code=403, detail="Только модератор может очистить общий чат")
     db.query(PublicChatMessage).delete()
     db.commit()
-    await chat_manager.broadcast({"type": "refresh"})
+    await chat_manager.broadcast({"type": "cleared"})
     return {"status": "cleared"}
 
 
@@ -1785,7 +1798,7 @@ async def public_chat_react(
     else:
         db.add(PublicChatReaction(message_id=message_id, user_id=current_user.id, emoji=req.emoji))
     db.commit()
-    await chat_manager.broadcast({"type": "refresh"})
+    await chat_manager.broadcast({"type": "message_updated", "message": serialize_public_message_public(db, message)})
 
     return serialize_public_message(db, message, current_user)
 
@@ -1801,13 +1814,25 @@ async def public_chat_pin(
     if not message:
         raise HTTPException(status_code=404, detail="Сообщение не найдено")
 
+    previous_pinned = None
     if message.is_pinned:
         message.is_pinned = False
     else:
+        previous_pinned = (
+            db.query(PublicChatMessage)
+            .filter(PublicChatMessage.is_pinned == True, PublicChatMessage.id != message_id)  # noqa: E712
+            .first()
+        )
         db.query(PublicChatMessage).filter(PublicChatMessage.is_pinned == True).update({"is_pinned": False})  # noqa: E712
         message.is_pinned = True
     db.commit()
-    await chat_manager.broadcast({"type": "refresh"})
+
+    await chat_manager.broadcast({"type": "message_updated", "message": serialize_public_message_public(db, message)})
+    if previous_pinned:
+        db.refresh(previous_pinned)
+        await chat_manager.broadcast(
+            {"type": "message_updated", "message": serialize_public_message_public(db, previous_pinned)}
+        )
 
     return serialize_public_message(db, message, current_user)
 
