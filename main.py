@@ -2064,7 +2064,7 @@ async def bot_public_chat_send(req: BotPublicChatRequest, db: Session = Depends(
 # ==================== Админ-панель (только для администратора) ====================
 
 @app.get("/api/admin/stats")
-async def admin_stats(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+async def admin_stats(current_user: User = Depends(require_moderator), db: Session = Depends(get_db)):
     """Общая статистика проекта — для админ-панели на сайте."""
     now = datetime.now(timezone.utc)
     online_cutoff = now - timedelta(minutes=5)
@@ -2080,6 +2080,14 @@ async def admin_stats(current_user: User = Depends(require_admin), db: Session =
 
     total_chat_messages = db.query(Message).count()
     total_public_messages = db.query(PublicChatMessage).count()
+    total_rooms = db.query(Room).count()
+    active_rooms = db.query(Room).filter(Room.status == "open").count()
+    banned_users = db.query(User).filter(User.is_banned == True).count()
+    staff_users = db.query(User).filter(User.role.in_(("moderator", "admin"))).count()
+    if ADMIN_TELEGRAM_ID:
+        super_admin = db.query(User).filter(User.telegram_id == ADMIN_TELEGRAM_ID).first()
+        if super_admin and (super_admin.role or "user") not in ("moderator", "admin"):
+            staff_users += 1
 
     total_posts = db.query(GalleryPost).count()
     approved_posts = db.query(GalleryPost).filter(GalleryPost.status == "approved").count()
@@ -2120,6 +2128,12 @@ async def admin_stats(current_user: User = Depends(require_admin), db: Session =
         "new_today": new_today,
         "new_week": new_week,
         "total_messages": total_chat_messages + total_public_messages,
+        "total_chat_messages": total_chat_messages,
+        "total_public_messages": total_public_messages,
+        "total_rooms": total_rooms,
+        "active_rooms": active_rooms,
+        "banned_users": banned_users,
+        "staff_users": staff_users,
         "total_gallery_posts": total_posts,
         "approved_posts": approved_posts,
         "rejected_posts": rejected_posts,
@@ -2134,7 +2148,7 @@ async def admin_stats(current_user: User = Depends(require_admin), db: Session =
 
 
 @app.get("/api/admin/users")
-async def admin_users(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+async def admin_users(current_user: User = Depends(require_moderator), db: Session = Depends(get_db)):
     """Список пользователей (последние активные — сверху) — для админ-панели."""
     now = datetime.now(timezone.utc)
     users = db.query(User).order_by(User.last_seen_at.desc().nullslast()).limit(150).all()
@@ -2155,13 +2169,15 @@ async def admin_users(current_user: User = Depends(require_admin), db: Session =
                 "last_seen_at": u.last_seen_at,
                 "is_online": is_online,
                 "is_admin": is_site_admin(u),
+                "role": get_effective_role(u),
+                "is_banned": bool(u.is_banned),
             }
         )
     return result
 
 
 @app.get("/api/admin/leaderboard")
-async def admin_leaderboard(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+async def admin_leaderboard(current_user: User = Depends(require_moderator), db: Session = Depends(get_db)):
     """Топ-15 пользователей по опыту."""
     users = db.query(User).order_by(User.xp.desc()).limit(15).all()
     return [
@@ -2177,7 +2193,7 @@ async def admin_leaderboard(current_user: User = Depends(require_admin), db: Ses
 
 
 @app.get("/api/admin/activity")
-async def admin_activity(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+async def admin_activity(current_user: User = Depends(require_moderator), db: Session = Depends(get_db)):
     """Лента последних событий (посты, комментарии, сообщения общего чата) — быстрый обзор модерации."""
     events = []
 
@@ -2191,7 +2207,9 @@ async def admin_activity(current_user: User = Depends(require_admin), db: Sessio
         preview = p.content[:100] + ("…" if len(p.content) > 100 else "")
         events.append(
             {
+                "id": p.id,
                 "kind": "gallery_post",
+                "user_id": p.user_id,
                 "author": author_display_name(p.user),
                 "content": preview,
                 "status": p.status,
@@ -2210,7 +2228,9 @@ async def admin_activity(current_user: User = Depends(require_admin), db: Sessio
         preview = c.content[:100] + ("…" if len(c.content) > 100 else "")
         events.append(
             {
+                "id": c.id,
                 "kind": "gallery_comment",
+                "user_id": c.user_id,
                 "author": author_display_name(c.user),
                 "content": preview,
                 "status": c.status,
@@ -2229,7 +2249,9 @@ async def admin_activity(current_user: User = Depends(require_admin), db: Sessio
         preview = m.content[:100] + ("…" if len(m.content) > 100 else "")
         events.append(
             {
+                "id": m.id,
                 "kind": "public_chat",
+                "user_id": m.user_id,
                 "author": author_display_name(m.user),
                 "content": preview,
                 "status": m.status,
