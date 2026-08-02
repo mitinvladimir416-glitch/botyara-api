@@ -11,6 +11,7 @@ API-сервер для сайта botyara.ru.
 """
 
 import asyncio
+import html as html_module
 import base64
 import logging
 import math
@@ -21,6 +22,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
@@ -2686,3 +2688,97 @@ async def public_user_profile(
         "joined_at": user.created_at,
         "is_me": user.id == current_user.id,
     }
+
+
+# ==================== Публичный шаринг постов галереи (БЕЗ входа на сайт) ====================
+# Цель — виральность: друг видит промпт и красивое превью-ссылки, не заходя на сайт,
+# и только после этого решает зарегистрироваться.
+
+CATEGORY_SHARE_LABELS = {
+    "suno": "музыки в Suno",
+    "image": "картинки",
+    "video": "видео",
+    "cover": "обложки трека",
+    "lyrics": "текста песни",
+    "other": "творчества",
+}
+
+
+@app.get("/api/public/gallery/{post_id}")
+async def public_gallery_post(post_id: int, db: Session = Depends(get_db)):
+    """Пост галереи БЕЗ авторизации — для просмотра по прямой ссылке, без входа на сайт."""
+    post = (
+        db.query(GalleryPost)
+        .options(joinedload(GalleryPost.user))
+        .filter(GalleryPost.id == post_id, GalleryPost.status == "approved")
+        .first()
+    )
+    if not post:
+        raise HTTPException(status_code=404, detail="Промпт не найден")
+
+    reaction_rows = db.query(GalleryLike).filter(GalleryLike.post_id == post_id).all()
+    reactions = {}
+    for r in reaction_rows:
+        reactions[r.emoji] = reactions.get(r.emoji, 0) + 1
+
+    return {
+        "id": post.id,
+        "content": post.content,
+        "category": post.category,
+        "author": author_display_name(post.user),
+        "author_avatar": post.user.avatar_base64,
+        "author_level": calc_level(post.user.xp or 0),
+        "created_at": post.created_at,
+        "reactions": reactions,
+    }
+
+
+@app.get("/share/gallery/{post_id}", response_class=HTMLResponse)
+async def share_gallery_post(post_id: int, db: Session = Depends(get_db)):
+    """
+    Лёгкая HTML-страница специально под расшаривание в мессенджеры/соцсети — боты превью
+    (Telegram, VK и т.д.) не выполняют JS, поэтому им нужны настоящие <meta property="og:..">
+    прямо в HTML. Живому человеку страница сразу перенаправляет на настоящий сайт.
+    """
+    post = (
+        db.query(GalleryPost)
+        .options(joinedload(GalleryPost.user))
+        .filter(GalleryPost.id == post_id, GalleryPost.status == "approved")
+        .first()
+    )
+    if not post:
+        return HTMLResponse("<h1>Промпт не найден или ещё не одобрен</h1>", status_code=404)
+
+    snippet_raw = post.content[:180] + ("…" if len(post.content) > 180 else "")
+    author_raw = author_display_name(post.user)
+    category_label = CATEGORY_SHARE_LABELS.get(post.category, CATEGORY_SHARE_LABELS["other"])
+
+    snippet = html_module.escape(snippet_raw)
+    author = html_module.escape(author_raw)
+    site_url = f"https://24promtbot.ru/gallery/{post.id}"
+    title = html_module.escape(f"Промпт для {category_label} от {author_raw} — Ботяра")
+
+    page = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<meta property="og:title" content="{title}">
+<meta property="og:description" content="{snippet}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="{site_url}">
+<meta property="og:site_name" content="Ботяра">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="{title}">
+<meta name="twitter:description" content="{snippet}">
+<meta http-equiv="refresh" content="0; url={site_url}">
+<script>window.location.replace("{site_url}");</script>
+<style>body{{font-family:sans-serif;background:#050b16;color:#fff;padding:40px;text-align:center}}</style>
+</head>
+<body>
+<p>Открываю промпт на сайте…</p>
+<p><a href="{site_url}" style="color:#8b5cf6">Перейти вручную →</a></p>
+</body>
+</html>"""
+    return HTMLResponse(page)
