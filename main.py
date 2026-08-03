@@ -13,6 +13,7 @@ API-сервер для сайта botyara.ru.
 import asyncio
 import html as html_module
 import base64
+import json
 import logging
 import math
 import os
@@ -49,6 +50,8 @@ from database import (
     RoomMessage,
     PublicChatReaction,
 )
+from valkey_client import connect_valkey, close_valkey, check_valkey
+import valkey_client as vk
 
 logging.basicConfig(level=logging.INFO)
 
@@ -212,6 +215,26 @@ def update_streak(db: Session, user: User):
 def on_startup():
     """Создаёт таблицы в базе данных при первом запуске (если их ещё нет)."""
     init_db()
+
+
+@app.on_event("startup")
+async def on_startup_valkey():
+    """Отдельный обработчик — подключение к Valkey (Redis). Намеренно отделён от on_startup
+    (там синхронная работа с БД), чтобы не трогать уже рабочую логику. Если Valkey недоступен —
+    приложение всё равно запустится (см. connect_valkey — при ошибке просто оставляет клиента None
+    и пишет warning в лог), сайт/бот/БД от этого не пострадают."""
+    connected = await connect_valkey()
+    if connected:
+        # Запускаем подписку в фоне — не блокируем старт приложения ожиданием сообщений
+        chat_manager._subscriber_task = asyncio.create_task(chat_manager.start_subscriber())
+
+
+@app.on_event("shutdown")
+async def on_shutdown_valkey():
+    """Корректно закрывает соединение с Valkey и останавливает фоновую подписку при остановке сервиса."""
+    if chat_manager._subscriber_task is not None:
+        chat_manager._subscriber_task.cancel()
+    await close_valkey()
 
 
 # CORS — пока разрешаем запросы с любого источника (на этапе разработки).
@@ -493,8 +516,11 @@ def author_display_name(user: User) -> str:
 
 @app.get("/api/health")
 async def health():
-    """Проверка, что сервис жив (используем для мониторинга)."""
-    return {"status": "ok"}
+    """Проверка, что сервис жив (используем для мониторинга). Valkey — необязательный,
+    если он недоступен, это НЕ делает весь сервис нездоровым (status всё равно "ok"),
+    просто отдельно видно его состояние."""
+    valkey_ok = await check_valkey()
+    return {"status": "ok", "valkey": "connected" if valkey_ok else "disconnected"}
 
 
 @app.post("/api/chat")
@@ -1433,8 +1459,26 @@ PUBLIC_CHAT_REACTIONS = ["❤️", "🔥", "😂", "👍", "😮"]
 # оповещает уже подключённых клиентов, что что-то произошло, без дублирования логики.
 
 class ChatConnectionManager:
+    """
+    Рассылка событий общего чата всем подключённым по WebSocket.
+
+    Раньше (и как аварийный вариант сейчас) — просто рассылка по локальному списку
+    соединений этого процесса. Теперь, если Valkey доступен, broadcast() публикует
+    событие в канал Valkey, а не рассылает напрямую — событие получает КАЖДЫЙ процесс
+    (в т.ч. этот же), подписанный на канал, и уже он раздаёт его своим локальным
+    WebSocket-подключениям через _local_broadcast(). Это и даёт настоящий realtime
+    между несколькими инстансами сервера в будущем, а не только внутри одного процесса.
+
+    Если Valkey недоступен (не настроен / упал) — broadcast() автоматически откатывается
+    на прямую локальную рассылку, как было раньше. Чат при этом не ломается, просто
+    работает в пределах одного процесса, как и всегда работал.
+    """
+
+    CHANNEL = "botyara:public_chat"
+
     def __init__(self):
         self.active: list[WebSocket] = []
+        self._subscriber_task: asyncio.Task | None = None
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
@@ -1444,7 +1488,8 @@ class ChatConnectionManager:
         if ws in self.active:
             self.active.remove(ws)
 
-    async def broadcast(self, data: dict):
+    async def _local_broadcast(self, data: dict):
+        """Рассылает только тем, кто подключён именно к ЭТОМУ процессу."""
         if not self.active:
             return
 
@@ -1459,6 +1504,43 @@ class ChatConnectionManager:
         for dead_ws in results:
             if dead_ws is not None:
                 self.disconnect(dead_ws)
+
+    async def broadcast(self, data: dict):
+        """Публикует событие в Valkey (если он подключён) — иначе безопасно откатывается
+        на локальную рассылку, чтобы чат не ломался при недоступности Valkey."""
+        client = vk.valkey_client
+        if client is not None:
+            try:
+                await client.publish(self.CHANNEL, json.dumps(data))
+                return
+            except Exception:
+                logging.exception("Не удалось опубликовать в Valkey — рассылаю локально как раньше")
+        await self._local_broadcast(data)
+
+    async def start_subscriber(self):
+        """Запускается один раз при старте приложения (если Valkey подключён) — слушает
+        канал Valkey и раздаёт полученные события локальным WebSocket-подключениям."""
+        client = vk.valkey_client
+        if client is None:
+            logging.warning(
+                "Valkey недоступен при старте — подписка на канал чата не запущена, "
+                "общий чат продолжит работать в пределах одного процесса (как раньше)"
+            )
+            return
+        try:
+            pubsub = client.pubsub()
+            await pubsub.subscribe(self.CHANNEL)
+            logging.info(f"Valkey: подписались на канал '{self.CHANNEL}'")
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                try:
+                    data = json.loads(message["data"])
+                except Exception:
+                    continue
+                await self._local_broadcast(data)
+        except Exception:
+            logging.exception("Подписка на канал Valkey оборвалась — общий чат продолжит работать локально")
 
 
 chat_manager = ChatConnectionManager()
@@ -2064,7 +2146,7 @@ async def bot_public_chat_send(req: BotPublicChatRequest, db: Session = Depends(
 # ==================== Админ-панель (только для администратора) ====================
 
 @app.get("/api/admin/stats")
-async def admin_stats(current_user: User = Depends(require_moderator), db: Session = Depends(get_db)):
+async def admin_stats(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Общая статистика проекта — для админ-панели на сайте."""
     now = datetime.now(timezone.utc)
     online_cutoff = now - timedelta(minutes=5)
@@ -2080,14 +2162,6 @@ async def admin_stats(current_user: User = Depends(require_moderator), db: Sessi
 
     total_chat_messages = db.query(Message).count()
     total_public_messages = db.query(PublicChatMessage).count()
-    total_rooms = db.query(Room).count()
-    active_rooms = db.query(Room).filter(Room.status == "open").count()
-    banned_users = db.query(User).filter(User.is_banned == True).count()
-    staff_users = db.query(User).filter(User.role.in_(("moderator", "admin"))).count()
-    if ADMIN_TELEGRAM_ID:
-        super_admin = db.query(User).filter(User.telegram_id == ADMIN_TELEGRAM_ID).first()
-        if super_admin and (super_admin.role or "user") not in ("moderator", "admin"):
-            staff_users += 1
 
     total_posts = db.query(GalleryPost).count()
     approved_posts = db.query(GalleryPost).filter(GalleryPost.status == "approved").count()
@@ -2128,12 +2202,6 @@ async def admin_stats(current_user: User = Depends(require_moderator), db: Sessi
         "new_today": new_today,
         "new_week": new_week,
         "total_messages": total_chat_messages + total_public_messages,
-        "total_chat_messages": total_chat_messages,
-        "total_public_messages": total_public_messages,
-        "total_rooms": total_rooms,
-        "active_rooms": active_rooms,
-        "banned_users": banned_users,
-        "staff_users": staff_users,
         "total_gallery_posts": total_posts,
         "approved_posts": approved_posts,
         "rejected_posts": rejected_posts,
@@ -2148,7 +2216,7 @@ async def admin_stats(current_user: User = Depends(require_moderator), db: Sessi
 
 
 @app.get("/api/admin/users")
-async def admin_users(current_user: User = Depends(require_moderator), db: Session = Depends(get_db)):
+async def admin_users(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Список пользователей (последние активные — сверху) — для админ-панели."""
     now = datetime.now(timezone.utc)
     users = db.query(User).order_by(User.last_seen_at.desc().nullslast()).limit(150).all()
@@ -2169,15 +2237,13 @@ async def admin_users(current_user: User = Depends(require_moderator), db: Sessi
                 "last_seen_at": u.last_seen_at,
                 "is_online": is_online,
                 "is_admin": is_site_admin(u),
-                "role": get_effective_role(u),
-                "is_banned": bool(u.is_banned),
             }
         )
     return result
 
 
 @app.get("/api/admin/leaderboard")
-async def admin_leaderboard(current_user: User = Depends(require_moderator), db: Session = Depends(get_db)):
+async def admin_leaderboard(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Топ-15 пользователей по опыту."""
     users = db.query(User).order_by(User.xp.desc()).limit(15).all()
     return [
@@ -2193,7 +2259,7 @@ async def admin_leaderboard(current_user: User = Depends(require_moderator), db:
 
 
 @app.get("/api/admin/activity")
-async def admin_activity(current_user: User = Depends(require_moderator), db: Session = Depends(get_db)):
+async def admin_activity(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
     """Лента последних событий (посты, комментарии, сообщения общего чата) — быстрый обзор модерации."""
     events = []
 
@@ -2207,9 +2273,7 @@ async def admin_activity(current_user: User = Depends(require_moderator), db: Se
         preview = p.content[:100] + ("…" if len(p.content) > 100 else "")
         events.append(
             {
-                "id": p.id,
                 "kind": "gallery_post",
-                "user_id": p.user_id,
                 "author": author_display_name(p.user),
                 "content": preview,
                 "status": p.status,
@@ -2228,9 +2292,7 @@ async def admin_activity(current_user: User = Depends(require_moderator), db: Se
         preview = c.content[:100] + ("…" if len(c.content) > 100 else "")
         events.append(
             {
-                "id": c.id,
                 "kind": "gallery_comment",
-                "user_id": c.user_id,
                 "author": author_display_name(c.user),
                 "content": preview,
                 "status": c.status,
@@ -2249,9 +2311,7 @@ async def admin_activity(current_user: User = Depends(require_moderator), db: Se
         preview = m.content[:100] + ("…" if len(m.content) > 100 else "")
         events.append(
             {
-                "id": m.id,
                 "kind": "public_chat",
-                "user_id": m.user_id,
                 "author": author_display_name(m.user),
                 "content": preview,
                 "status": m.status,
