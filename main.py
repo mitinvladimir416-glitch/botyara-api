@@ -23,7 +23,7 @@ import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -446,9 +446,23 @@ class BotPublicChatRequest(BaseModel):
 # ==================== Авторизация: вспомогательное ====================
 
 security = HTTPBearer(auto_error=False)
+SESSION_COOKIE_NAME = "botyara_session"
+
+
+def set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=auth.TOKEN_LIFETIME_SECONDS,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+    )
 
 
 def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: Session = Depends(get_db),
 ) -> User:
@@ -456,10 +470,11 @@ def get_current_user(
     Зависимость FastAPI: проверяет токен из заголовка "Authorization: Bearer <токен>"
     и возвращает текущего пользователя. Если токена нет или он невалиден — ошибка 401.
     """
-    if credentials is None:
+    token = credentials.credentials if credentials is not None else request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
         raise HTTPException(status_code=401, detail="Нужна авторизация")
 
-    user_id = auth.decode_access_token(credentials.credentials)
+    user_id = auth.decode_access_token(token)
     if user_id is None:
         raise HTTPException(status_code=401, detail="Недействительный или истёкший токен")
 
@@ -783,7 +798,7 @@ async def cover(req: CoverRequest):
 # ==================== Авторизация ====================
 
 @app.post("/api/auth/register")
-async def register(req: RegisterRequest, request: Request, db: Session = Depends(get_db)):
+async def register(req: RegisterRequest, request: Request, response: Response, db: Session = Depends(get_db)):
     """Регистрация по email и паролю."""
     check_rate_limit(f"register:{client_ip(request)}", max_calls=5, window_seconds=300)
     existing = db.query(User).filter(User.email == req.email).first()
@@ -796,11 +811,12 @@ async def register(req: RegisterRequest, request: Request, db: Session = Depends
     db.refresh(user)
 
     token = auth.create_access_token(user.id)
+    set_session_cookie(response, token)
     return {"access_token": token, "user": {"id": user.id, "email": user.email}}
 
 
 @app.post("/api/auth/login")
-async def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
+async def login(req: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)):
     """Вход по email и паролю."""
     check_rate_limit(f"login:{client_ip(request)}", max_calls=10, window_seconds=300)
     user = db.query(User).filter(User.email == req.email).first()
@@ -808,7 +824,28 @@ async def login(req: LoginRequest, request: Request, db: Session = Depends(get_d
         raise HTTPException(status_code=401, detail="Неверный email или пароль")
 
     token = auth.create_access_token(user.id)
+    set_session_cookie(response, token)
     return {"access_token": token, "user": {"id": user.id, "email": user.email}}
+
+
+@app.post("/api/auth/session")
+async def restore_auth_session(response: Response, current_user: User = Depends(get_current_user)):
+    """Восстанавливает JS-сессию из защищённой cookie после повторного открытия сайта."""
+    token = auth.create_access_token(current_user.id)
+    set_session_cookie(response, token)
+    return {"access_token": token}
+
+
+@app.post("/api/auth/logout")
+async def logout(response: Response):
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        httponly=True,
+        secure=True,
+        samesite="none",
+        path="/",
+    )
+    return {"ok": True}
 
 
 # ==================== Вход через бота (альтернатива виджету, без привязки к домену) ====================
@@ -839,7 +876,7 @@ async def telegram_login_start(request: Request):
 
 
 @app.get("/api/auth/telegram/poll")
-async def telegram_login_poll(token: str, request: Request, db: Session = Depends(get_db)):
+async def telegram_login_poll(token: str, request: Request, response: Response, db: Session = Depends(get_db)):
     """Сайт опрашивает это раз в пару секунд, пока пользователь не подтвердит вход через бота."""
     check_rate_limit(f"tg_login_poll:{client_ip(request)}", max_calls=200, window_seconds=300)
     entry = pending_telegram_logins.get(token)
@@ -872,6 +909,7 @@ async def telegram_login_poll(token: str, request: Request, db: Session = Depend
         db.commit()
 
     access_token = auth.create_access_token(user.id)
+    set_session_cookie(response, access_token)
     return {
         "status": "confirmed",
         "access_token": access_token,
