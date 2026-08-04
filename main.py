@@ -12,6 +12,7 @@ API-сервер для сайта botyara.ru.
 
 import asyncio
 import html as html_module
+import hmac
 import base64
 import json
 import logging
@@ -65,6 +66,9 @@ app = FastAPI(title="Botyara API", version="0.2.0")
 # Секрет для проверки, что запросы на /api/bot/* приходят именно от нашего Telegram-бота,
 # а не от кого попало. Должен совпадать со значением BOT_INTERNAL_SECRET в Railway (у бота).
 BOT_INTERNAL_SECRET = os.getenv("BOT_INTERNAL_SECRET")
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))
+MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(20 * 1024 * 1024)))
+SHOP_PURCHASES_ENABLED = os.getenv("SHOP_PURCHASES_ENABLED", "false").lower() == "true"
 
 # Telegram ID администратора сайта — тот же человек, что ADMIN_ID у бота. Аккаунт с таким
 # telegram_id получает права модератора (может чистить общий чат/галерею).
@@ -108,6 +112,10 @@ _rate_limit_state: dict[str, list[float]] = {}
 
 def check_rate_limit(key: str, max_calls: int, window_seconds: float) -> None:
     now = time.time()
+    if len(_rate_limit_state) > 10_000:
+        stale_before = now - 3600
+        for stale_key in [k for k, values in _rate_limit_state.items() if not values or values[-1] < stale_before]:
+            _rate_limit_state.pop(stale_key, None)
     calls = _rate_limit_state.setdefault(key, [])
     calls[:] = [t for t in calls if now - t < window_seconds]
     if len(calls) >= max_calls:
@@ -247,15 +255,25 @@ async def on_shutdown_valkey():
     await close_valkey()
 
 
-# CORS — пока разрешаем запросы с любого источника (на этапе разработки).
-# Когда появится домен сайта, сузим список до конкретного домена (https://botyara.ru).
+cors_origins = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "https://24promtbot.ru").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Bot-Secret"],
 )
+
+
+async def read_upload_limited(upload: UploadFile, max_bytes: int, kind: str) -> bytes:
+    data = await upload.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=413, detail=f"{kind} is too large")
+    return data
 
 
 # ==================== Схемы запросов ====================
@@ -478,7 +496,7 @@ def verify_bot_secret(x_bot_secret: str | None = Header(default=None)):
     """
     if not BOT_INTERNAL_SECRET:
         raise HTTPException(status_code=500, detail="BOT_INTERNAL_SECRET не настроен на сервере")
-    if x_bot_secret != BOT_INTERNAL_SECRET:
+    if not x_bot_secret or not hmac.compare_digest(x_bot_secret, BOT_INTERNAL_SECRET):
         raise HTTPException(status_code=401, detail="Неверный секрет бота")
 
 
@@ -685,7 +703,7 @@ async def prompt_image_from_photo(
     photo: UploadFile = File(...),
 ):
     """Анализ фото + составление промпта для его правки (раздел Промпты → Картинка)."""
-    photo_bytes = await photo.read()
+    photo_bytes = await read_upload_limited(photo, MAX_IMAGE_BYTES, "Image")
     photo_base64 = base64.b64encode(photo_bytes).decode("utf-8")
     reply = ai_service.get_image_prompt_from_photo(photo_base64, desired_change, history=[])
     is_final = "ГОТОВЫЙ ПРОМПТ:" in reply
@@ -703,9 +721,9 @@ async def prompt_video_frames(
     first_b64 = None
     last_b64 = None
     if first_frame is not None:
-        first_b64 = base64.b64encode(await first_frame.read()).decode("utf-8")
+        first_b64 = base64.b64encode(await read_upload_limited(first_frame, MAX_IMAGE_BYTES, "Image")).decode("utf-8")
     if last_frame is not None:
-        last_b64 = base64.b64encode(await last_frame.read()).decode("utf-8")
+        last_b64 = base64.b64encode(await read_upload_limited(last_frame, MAX_IMAGE_BYTES, "Image")).decode("utf-8")
 
     reply = ai_service.get_video_prompt_from_frames(
         target or None, description, first_b64, last_b64, history=[]
@@ -722,7 +740,7 @@ async def voice_transcribe(
     """Распознаёт голосовое сообщение с сайта в текст (раздел Общение)."""
     suffix = os.path.splitext(audio.filename or "audio.webm")[1] or ".webm"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await audio.read())
+        tmp.write(await read_upload_limited(audio, MAX_AUDIO_BYTES, "Audio"))
         tmp_path = tmp.name
 
     try:
@@ -2892,6 +2910,16 @@ PREMIUM_PLANS = {
     "premium_1y": {"name": "💎 Ботяра Premium — 1 год", "price": 1190, "days": 365},
 }
 
+SHOP_PACKAGES = {
+    "starter": {
+        "name": "Стартовый набор украшений",
+        "description": "Огненная рамка, золотой ник и титул «Легенда»",
+        "price": 39,
+        "original_price": 67,
+        "item_keys": ["frame_fire", "name_gold", "title_legend"],
+    },
+}
+
 
 def seed_shop_items(db: Session) -> None:
     """Заполняет каталог магазина при первом запуске — только если он ещё пуст,
@@ -2930,7 +2958,7 @@ def seed_shop_items(db: Session) -> None:
         {"key": "xp_large", "name": "⚡ 1500 XP", "category": "xp", "price": 149, "xp_amount": 1500},
     ]
     for i, data in enumerate(items):
-        db.add(ShopItem(sort_order=i, **data))
+        db.add(ShopItem(sort_order=i, is_active=True, **data))
     db.commit()
     logging.info(f"Магазин: засеяно {len(items)} товаров")
 
@@ -2952,6 +2980,20 @@ def apply_purchased_item(db: Session, user: User, purchase: ShopPurchase) -> Non
     """Применяет купленное к аккаунту. Единственное место, где это происходит — только
     после подтверждения оплаты админом. Пользователь никак не может вызвать это сам за
     себя без реального подтверждённого платежа."""
+    if purchase.plan and purchase.plan.startswith("package:"):
+        package = SHOP_PACKAGES.get(purchase.plan.split(":", 1)[1])
+        if not package:
+            return
+        items = db.query(ShopItem).filter(ShopItem.key.in_(package["item_keys"])).all()
+        for item in items:
+            exists = db.query(UserInventoryItem).filter(
+                UserInventoryItem.user_id == user.id,
+                UserInventoryItem.shop_item_id == item.id,
+            ).first()
+            if not exists:
+                db.add(UserInventoryItem(user_id=user.id, shop_item_id=item.id))
+        return
+
     if purchase.plan:
         plan_info = PREMIUM_PLANS.get(purchase.plan)
         days = plan_info["days"] if plan_info else 30
@@ -3017,6 +3059,8 @@ async def shop_catalog(db: Session = Depends(get_db)):
     return {
         "items": [serialize_shop_item(i) for i in items],
         "premium_plans": PREMIUM_PLANS,
+        "packages": SHOP_PACKAGES,
+        "purchases_enabled": SHOP_PURCHASES_ENABLED,
     }
 
 
@@ -3113,6 +3157,8 @@ async def shop_my_purchases(
     return [
         {
             "id": p.id,
+            "item_id": p.shop_item_id,
+            "item_key": p.item.key if p.item else p.plan,
             "item_name": p.item_name,
             "price": p.price,
             "status": p.status,
@@ -3130,6 +3176,9 @@ async def shop_purchase(
 ):
     """Оформляет заявку на покупку (товар или Premium). Реальную оплату обсуждаете отдельно
     (кнопка «Связь со мной») — после получения денег админ подтверждает заявку в панели."""
+    if not SHOP_PURCHASES_ENABLED:
+        raise HTTPException(status_code=503, detail="Purchases are temporarily unavailable until YooKassa is connected")
+
     shop_item = None
     plan = None
 
@@ -3138,6 +3187,21 @@ async def shop_purchase(
         if not plan_info:
             raise HTTPException(status_code=404, detail="Такого плана подписки нет")
         item_name, price, plan = plan_info["name"], plan_info["price"], req.plan
+    elif req.item_key and req.item_key.startswith("package:"):
+        package_key = req.item_key.split(":", 1)[1]
+        package = SHOP_PACKAGES.get(package_key)
+        if not package:
+            raise HTTPException(status_code=404, detail="Package not found")
+        item_name, price, plan = package["name"], package["price"], req.item_key
+        owned_keys = {
+            row[0]
+            for row in db.query(ShopItem.key)
+            .join(UserInventoryItem, UserInventoryItem.shop_item_id == ShopItem.id)
+            .filter(UserInventoryItem.user_id == current_user.id, ShopItem.key.in_(package["item_keys"]))
+            .all()
+        }
+        if owned_keys == set(package["item_keys"]):
+            raise HTTPException(status_code=400, detail="You already own every item in this package")
     elif req.item_key:
         shop_item = db.query(ShopItem).filter(ShopItem.key == req.item_key, ShopItem.is_active == True).first()  # noqa: E712
         if not shop_item:

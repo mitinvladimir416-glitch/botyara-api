@@ -8,13 +8,14 @@ import os
 import time
 
 import bcrypt
-from jose import jwt, JWTError
+import jwt
+from jwt import InvalidTokenError
 
 SECRET_KEY = os.getenv("AUTH_SECRET_KEY")
-if not SECRET_KEY:
+if not SECRET_KEY or len(SECRET_KEY) < 32:
     raise ValueError(
         "Не найден AUTH_SECRET_KEY — придумай длинную случайную строку и добавь "
-        "её в переменные окружения (это ключ для подписи токенов входа)"
+        "её в переменные окружения (это ключ для подписи токенов входа); минимум 32 символа"
     )
 
 ALGORITHM = "HS256"
@@ -50,5 +51,5 @@ def decode_access_token(token: str) -> int | None:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return int(payload["sub"])
-    except (JWTError, KeyError, ValueError):
+    except (InvalidTokenError, KeyError, ValueError):
         return None

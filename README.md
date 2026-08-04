@@ -56,5 +56,12 @@ uvicorn main:app --reload
 - Сейчас у API **нет авторизации** и он не подключён к базе данных — это следующий этап
 - История переписки, промпты и т.д. пока хранятся только на стороне того, кто вызывает API
   (в будущем — на сайте, у пользователя в браузере или в базе данных после того как добавим авторизацию)
-- CORS сейчас открыт для всех источников (`allow_origins=["*"]`) — это нормально для разработки,
-  но когда появится домен сайта, нужно будет ограничить до `https://botyara.ru`
+- CORS принимает запросы только от адресов из `CORS_ALLOWED_ORIGINS`.
+
+## Security configuration
+
+- `AUTH_SECRET_KEY` is required and must contain at least 32 characters.
+- `BOT_INTERNAL_SECRET` protects all `/api/bot/*` endpoints.
+- `CORS_ALLOWED_ORIGINS` is a comma-separated allowlist (defaults to `https://24promtbot.ru`).
+- `MAX_IMAGE_BYTES` and `MAX_AUDIO_BYTES` control upload limits (8 MiB and 20 MiB by default).
+- `SHOP_PURCHASES_ENABLED=false` keeps the decoration shop in view-only mode until YooKassa is connected.
