@@ -7,6 +7,6 @@ python-multipart
 sqlalchemy
 psycopg2-binary
 bcrypt
-python-jose[cryptography]
+PyJWT>=2.12.0,<3
 email-validator
 redis[hiredis]
