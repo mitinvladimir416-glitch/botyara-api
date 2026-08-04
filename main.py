@@ -2922,10 +2922,7 @@ SHOP_PACKAGES = {
 
 
 def seed_shop_items(db: Session) -> None:
-    """Заполняет каталог магазина при первом запуске — только если он ещё пуст,
-    чтобы не перезаписывать то, что админ уже поменял через админку."""
-    if db.query(ShopItem).count() > 0:
-        return
+    """Добавляет недостающие стандартные товары без изменения существующих позиций."""
 
     items = [
         # ---- Рамки для аватарки (CSS) ----
@@ -2941,6 +2938,44 @@ def seed_shop_items(db: Session) -> None:
         {"key": "frame_stardust", "name": "✨ Звёздная пыль (анимация)", "category": "frame", "price": 49, "css_value": "stardust"},
         {"key": "frame_gold", "name": "👑 Королевская (золото)", "category": "frame", "price": 59, "css_value": "gold"},
         {"key": "frame_crystal", "name": "💎 Кристальная (анимация)", "category": "frame", "price": 79, "css_value": "crystal"},
+        # ---- Музыкальная коллекция ----
+        {"key": "frame_music_rock", "name": "🎸 Rock", "category": "frame", "price": 49, "css_value": "music-rock"},
+        {"key": "frame_music_hiphop", "name": "⛓ Hip-Hop", "category": "frame", "price": 59, "css_value": "music-hiphop"},
+        {"key": "frame_music_rap", "name": "🎙 Rap", "category": "frame", "price": 49, "css_value": "music-rap"},
+        {"key": "frame_music_blues", "name": "🎤 Blues", "category": "frame", "price": 49, "css_value": "music-blues"},
+        {"key": "frame_music_jazz", "name": "🎷 Jazz", "category": "frame", "price": 59, "css_value": "music-jazz"},
+        {"key": "frame_music_classical", "name": "🎻 Classical", "category": "frame", "price": 59, "css_value": "music-classical"},
+        {"key": "frame_music_electronic", "name": "🎛 Electronic", "category": "frame", "price": 69, "css_value": "music-electronic"},
+        {"key": "frame_music_metal", "name": "☠ Metal", "category": "frame", "price": 69, "css_value": "music-metal"},
+        {"key": "frame_music_reggae", "name": "🦁 Reggae", "category": "frame", "price": 59, "css_value": "music-reggae"},
+        {"key": "frame_music_country", "name": "🤠 Country", "category": "frame", "price": 49, "css_value": "music-country"},
+        # ---- Коллекция уровней ----
+        {"key": "frame_level_novice", "name": "🌿 Новичок", "category": "frame", "price": 19, "css_value": "level-novice"},
+        {"key": "frame_level_student", "name": "💠 Ученик", "category": "frame", "price": 25, "css_value": "level-student"},
+        {"key": "frame_level_active", "name": "🏅 Активный", "category": "frame", "price": 29, "css_value": "level-active"},
+        {"key": "frame_level_explorer", "name": "🔷 Исследователь", "category": "frame", "price": 35, "css_value": "level-explorer"},
+        {"key": "frame_level_curious", "name": "🔮 Пытливый ум", "category": "frame", "price": 39, "css_value": "level-curious"},
+        {"key": "frame_level_observer", "name": "💚 Наблюдатель", "category": "frame", "price": 39, "css_value": "level-observer"},
+        {"key": "frame_level_enthusiast", "name": "✨ Энтузиаст", "category": "frame", "price": 45, "css_value": "level-enthusiast"},
+        {"key": "frame_level_creator", "name": "🟣 Создатель", "category": "frame", "price": 49, "css_value": "level-creator"},
+        {"key": "frame_level_analyst", "name": "🔹 Аналитик", "category": "frame", "price": 49, "css_value": "level-analyst"},
+        {"key": "frame_level_ai_explorer", "name": "🌐 Исследователь AI", "category": "frame", "price": 59, "css_value": "level-ai-explorer"},
+        {"key": "frame_level_pioneer", "name": "🔥 Первопроходец", "category": "frame", "price": 69, "css_value": "level-pioneer"},
+        {"key": "frame_level_master", "name": "❄ Мастер знаний", "category": "frame", "price": 79, "css_value": "level-master"},
+        {"key": "frame_level_visionary", "name": "🔮 Визионер", "category": "frame", "price": 89, "css_value": "level-visionary"},
+        {"key": "frame_level_legend", "name": "👑 Легенда", "category": "frame", "price": 99, "css_value": "level-legend"},
+        {"key": "frame_level_ai_lord", "name": "🌈 Повелитель AI", "category": "frame", "price": 119, "css_value": "level-ai-lord"},
+        # ---- Неоновая коллекция ----
+        {"key": "frame_neon_magenta_square", "name": "💗 Magenta Square", "category": "frame", "price": 49, "css_value": "neon-magenta-square"},
+        {"key": "frame_neon_magenta_round", "name": "🟣 Magenta Ring", "category": "frame", "price": 49, "css_value": "neon-magenta-round"},
+        {"key": "frame_neon_cyan_square", "name": "🧊 Cyan Tech", "category": "frame", "price": 55, "css_value": "neon-cyan-square"},
+        {"key": "frame_neon_danger", "name": "🚨 Red Danger", "category": "frame", "price": 59, "css_value": "neon-danger"},
+        {"key": "frame_neon_cyan_round", "name": "🌀 Cyber Ring", "category": "frame", "price": 55, "css_value": "neon-cyan-round"},
+        {"key": "frame_neon_violet_square", "name": "💜 Violet Signal", "category": "frame", "price": 59, "css_value": "neon-violet-square"},
+        {"key": "frame_neon_pink_square", "name": "🌺 Pink 03", "category": "frame", "price": 55, "css_value": "neon-pink-square"},
+        {"key": "frame_neon_orange_round", "name": "🟠 Amber Ring", "category": "frame", "price": 55, "css_value": "neon-orange-round"},
+        {"key": "frame_neon_toxic", "name": "☣ Toxic Grid", "category": "frame", "price": 59, "css_value": "neon-toxic"},
+        {"key": "frame_neon_blue_square", "name": "🔵 Blue Signal", "category": "frame", "price": 59, "css_value": "neon-blue-square"},
         # ---- Цвет ника ----
         {"key": "name_red", "name": "❤️ Красный ник", "category": "name_color", "price": 15, "css_value": "#f87171"},
         {"key": "name_blue", "name": "💙 Синий ник", "category": "name_color", "price": 15, "css_value": "#60a5fa"},
@@ -2957,10 +2992,16 @@ def seed_shop_items(db: Session) -> None:
         {"key": "xp_medium", "name": "⚡ 600 XP", "category": "xp", "price": 69, "xp_amount": 600},
         {"key": "xp_large", "name": "⚡ 1500 XP", "category": "xp", "price": 149, "xp_amount": 1500},
     ]
+    existing_keys = {row[0] for row in db.query(ShopItem.key).all()}
+    added = 0
     for i, data in enumerate(items):
+        if data["key"] in existing_keys:
+            continue
         db.add(ShopItem(sort_order=i, is_active=True, **data))
-    db.commit()
-    logging.info(f"Магазин: засеяно {len(items)} товаров")
+        added += 1
+    if added:
+        db.commit()
+        logging.info(f"Магазин: добавлено {added} новых товаров")
 
 
 def get_active_subscription(db: Session, user: User):
