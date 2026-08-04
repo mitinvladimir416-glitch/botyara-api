@@ -58,6 +58,10 @@ class User(Base):
     badge_text = Column(String, nullable=True)   # кастомное "украшение" — короткий титул рядом с именем
     badge_color = Column(String, nullable=True)  # цвет титула (hex), задаётся админом
 
+    # Экипировка из магазина оформления — что из ИНВЕНТАРЯ надето прямо сейчас (см. UserInventoryItem)
+    active_frame = Column(String, nullable=True)       # ключ товара-рамки (например "frame_fire") или NULL
+    active_name_color = Column(String, nullable=True)  # hex-цвет ника или NULL
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     favorites = relationship("Favorite", back_populates="user", cascade="all, delete-orphan")
@@ -247,6 +251,78 @@ class RoomMessage(Base):
 
     room = relationship("Room", back_populates="messages")
     user = relationship("User")
+
+
+class ShopItem(Base):
+    """Товар магазина оформления — теперь хранится в БД (не в коде), чтобы админ мог
+    создавать/менять цену/скрывать товары без деплоя нового кода."""
+    __tablename__ = "shop_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String, unique=True, index=True, nullable=False)  # стабильный ключ, напр. "frame_fire"
+    name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    category = Column(String, nullable=False)  # frame / name_color / title / xp / premium
+    price = Column(Integer, nullable=False)  # в рублях
+    discount_percent = Column(Integer, nullable=False, server_default="0")
+    image_url = Column(String, nullable=True)  # для будущих настоящих картинок (сейчас рамки — CSS)
+    css_value = Column(String, nullable=True)  # для frame — ключ CSS-стиля; для name_color — hex
+    badge_text = Column(String, nullable=True)   # для category="title"
+    badge_color = Column(String, nullable=True)  # для category="title"
+    xp_amount = Column(Integer, nullable=True)   # для category="xp"
+    is_active = Column(Boolean, nullable=False, server_default="true")
+    sort_order = Column(Integer, nullable=False, server_default="0")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserInventoryItem(Base):
+    """Что пользователь реально купил (владеет) — отдельно от того, что сейчас НАДЕТО
+    (см. User.active_frame/active_name_color). Позволяет менять экипировку без ограничений."""
+    __tablename__ = "user_inventory_items"
+    __table_args__ = (UniqueConstraint("user_id", "shop_item_id", name="uq_inventory_user_item"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    shop_item_id = Column(Integer, ForeignKey("shop_items.id"), index=True, nullable=False)
+    acquired_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+    item = relationship("ShopItem")
+
+
+class Subscription(Base):
+    """Premium-подписка. Активность проверяется динамически по expires_at (> now) —
+    без фоновых задач: истёкшая подписка просто перестаёт считаться активной сама по себе."""
+    __tablename__ = "subscriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    plan = Column(String, nullable=False, server_default="premium")
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    auto_renew = Column(Boolean, nullable=False, server_default="true")
+    cancelled_at = Column(DateTime(timezone=True), nullable=True)
+
+    user = relationship("User")
+
+
+class ShopPurchase(Base):
+    """Заявка на покупку (товар из магазина, XP-пак или Premium). Оплата пока идёт вручную
+    (нет подключённого платёжного шлюза) — заявка уведомляет админа, после получения оплаты
+    вне сайта он подтверждает её в админке, и покупка применяется к аккаунту автоматически."""
+    __tablename__ = "shop_purchases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True, nullable=False)
+    shop_item_id = Column(Integer, ForeignKey("shop_items.id"), index=True, nullable=True)  # NULL для Premium
+    item_name = Column(String, nullable=False)
+    price = Column(Integer, nullable=False)
+    plan = Column(String, nullable=True)  # заполнено, если это покупка подписки
+    status = Column(String, nullable=False, server_default="pending")  # pending/fulfilled/cancelled
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User")
+    item = relationship("ShopItem")
 
 
 def init_db():
