@@ -35,6 +35,7 @@ import auth
 from database import (
     get_db,
     init_db,
+    SessionLocal,
     User,
     Favorite,
     Message,
@@ -49,6 +50,10 @@ from database import (
     RoomParticipant,
     RoomMessage,
     PublicChatReaction,
+    ShopItem,
+    UserInventoryItem,
+    Subscription,
+    ShopPurchase,
 )
 from valkey_client import connect_valkey, close_valkey, check_valkey
 import valkey_client as vk
@@ -215,6 +220,11 @@ def update_streak(db: Session, user: User):
 def on_startup():
     """Создаёт таблицы в базе данных при первом запуске (если их ещё нет)."""
     init_db()
+    db = SessionLocal()
+    try:
+        seed_shop_items(db)
+    finally:
+        db.close()
 
 
 @app.on_event("startup")
@@ -884,6 +894,9 @@ async def get_me(current_user: User = Depends(get_current_user), db: Session = D
         "is_admin": is_full_admin(current_user),
         "is_moderator": is_moderator(current_user),
         "badge": author_badge(current_user),
+        "avatar_frame": current_user.active_frame,
+        "name_color": current_user.active_name_color,
+        "is_premium": is_premium_active(db, current_user),
         "xp": current_user.xp or 0,
         "level": level,
         "level_title": level_title(level),
@@ -2765,6 +2778,9 @@ async def public_user_profile(
         "xp": user.xp or 0,
         "current_streak": user.current_streak or 0,
         "badge": author_badge(user),
+        "avatar_frame": user.active_frame,
+        "name_color": user.active_name_color,
+        "is_premium": is_premium_active(db, user),
         "achievements": achievements,
         "gallery_posts": gallery_posts,
         "joined_at": user.created_at,
@@ -2864,3 +2880,471 @@ async def share_gallery_post(post_id: int, db: Session = Depends(get_db)):
 </body>
 </html>"""
     return HTMLResponse(page)
+
+
+# ==================== Магазин, инвентарь, XP-паки, Premium-подписка ====================
+# Оплата пока идёт вручную (нет подключённого платёжного шлюза ЮKassa — ждём реальные ключи) —
+# заявка на покупку уведомляет админа, после получения оплаты вне сайта он подтверждает её
+# в админке, и покупка применяется к аккаунту автоматически и безопасно (только сервером).
+
+PREMIUM_PLANS = {
+    "premium_1m": {"name": "💎 Ботяра Premium — 1 месяц", "price": 149, "days": 30},
+    "premium_1y": {"name": "💎 Ботяра Premium — 1 год", "price": 1190, "days": 365},
+}
+
+
+def seed_shop_items(db: Session) -> None:
+    """Заполняет каталог магазина при первом запуске — только если он ещё пуст,
+    чтобы не перезаписывать то, что админ уже поменял через админку."""
+    if db.query(ShopItem).count() > 0:
+        return
+
+    items = [
+        # ---- Рамки для аватарки (CSS) ----
+        {"key": "frame_rose", "name": "🌸 Розовая рамка", "category": "frame", "price": 19, "css_value": "rose"},
+        {"key": "frame_ocean", "name": "🌊 Океан", "category": "frame", "price": 19, "css_value": "ocean"},
+        {"key": "frame_fire", "name": "🔥 Огненная рамка", "category": "frame", "price": 29, "css_value": "fire"},
+        {"key": "frame_electro", "name": "⚡ Электро", "category": "frame", "price": 29, "css_value": "electro"},
+        {"key": "frame_magenta", "name": "💜 Неон-магента", "category": "frame", "price": 35, "css_value": "magenta"},
+        {"key": "frame_cyber", "name": "🌀 Кибер-циан", "category": "frame", "price": 35, "css_value": "cyber"},
+        {"key": "frame_toxic", "name": "☣️ Токсик", "category": "frame", "price": 35, "css_value": "toxic"},
+        {"key": "frame_danger", "name": "🚨 Опасность", "category": "frame", "price": 39, "css_value": "danger"},
+        {"key": "frame_rainbow", "name": "🌈 Радужная (анимация)", "category": "frame", "price": 49, "css_value": "rainbow"},
+        {"key": "frame_stardust", "name": "✨ Звёздная пыль (анимация)", "category": "frame", "price": 49, "css_value": "stardust"},
+        {"key": "frame_gold", "name": "👑 Королевская (золото)", "category": "frame", "price": 59, "css_value": "gold"},
+        {"key": "frame_crystal", "name": "💎 Кристальная (анимация)", "category": "frame", "price": 79, "css_value": "crystal"},
+        # ---- Цвет ника ----
+        {"key": "name_red", "name": "❤️ Красный ник", "category": "name_color", "price": 15, "css_value": "#f87171"},
+        {"key": "name_blue", "name": "💙 Синий ник", "category": "name_color", "price": 15, "css_value": "#60a5fa"},
+        {"key": "name_green", "name": "💚 Зелёный ник", "category": "name_color", "price": 15, "css_value": "#4ade80"},
+        {"key": "name_gold", "name": "💛 Золотой ник", "category": "name_color", "price": 19, "css_value": "#facc15"},
+        {"key": "name_violet", "name": "💜 Фиолетовый ник", "category": "name_color", "price": 15, "css_value": "#a78bfa"},
+        # ---- Титулы ----
+        {"key": "title_legend", "name": "🏆 Легенда", "category": "title", "price": 19, "badge_text": "🏆 Легенда", "badge_color": "#facc15"},
+        {"key": "title_vip", "name": "💎 VIP", "category": "title", "price": 29, "badge_text": "💎 VIP", "badge_color": "#22d3ee"},
+        {"key": "title_boss", "name": "😎 Босс движухи", "category": "title", "price": 19, "badge_text": "😎 Босс движухи", "badge_color": "#fb7185"},
+        {"key": "title_founder", "name": "🚀 Первопроходец", "category": "title", "price": 25, "badge_text": "🚀 Первопроходец", "badge_color": "#4ade80"},
+        # ---- XP-паки ----
+        {"key": "xp_small", "name": "⚡ 200 XP", "category": "xp", "price": 29, "xp_amount": 200},
+        {"key": "xp_medium", "name": "⚡ 600 XP", "category": "xp", "price": 69, "xp_amount": 600},
+        {"key": "xp_large", "name": "⚡ 1500 XP", "category": "xp", "price": 149, "xp_amount": 1500},
+    ]
+    for i, data in enumerate(items):
+        db.add(ShopItem(sort_order=i, **data))
+    db.commit()
+    logging.info(f"Магазин: засеяно {len(items)} товаров")
+
+
+def get_active_subscription(db: Session, user: User):
+    return (
+        db.query(Subscription)
+        .filter(Subscription.user_id == user.id, Subscription.expires_at > datetime.now(timezone.utc))
+        .order_by(Subscription.expires_at.desc())
+        .first()
+    )
+
+
+def is_premium_active(db: Session, user: User) -> bool:
+    return get_active_subscription(db, user) is not None
+
+
+def apply_purchased_item(db: Session, user: User, purchase: ShopPurchase) -> None:
+    """Применяет купленное к аккаунту. Единственное место, где это происходит — только
+    после подтверждения оплаты админом. Пользователь никак не может вызвать это сам за
+    себя без реального подтверждённого платежа."""
+    if purchase.plan:
+        plan_info = PREMIUM_PLANS.get(purchase.plan)
+        days = plan_info["days"] if plan_info else 30
+        existing = get_active_subscription(db, user)
+        base = existing.expires_at if existing else datetime.now(timezone.utc)
+        if existing:
+            existing.expires_at = base + timedelta(days=days)
+            existing.auto_renew = True
+        else:
+            db.add(Subscription(user_id=user.id, plan="premium", expires_at=base + timedelta(days=days)))
+        return
+
+    item = purchase.item
+    if not item:
+        return
+    if item.category == "xp":
+        add_xp(db, user, item.xp_amount or 0)
+        return
+
+    existing_inv = (
+        db.query(UserInventoryItem)
+        .filter(UserInventoryItem.user_id == user.id, UserInventoryItem.shop_item_id == item.id)
+        .first()
+    )
+    if not existing_inv:
+        db.add(UserInventoryItem(user_id=user.id, shop_item_id=item.id))
+
+
+def serialize_shop_item(item: ShopItem) -> dict:
+    price = item.price
+    final_price = round(price * (100 - item.discount_percent) / 100) if item.discount_percent else price
+    return {
+        "id": item.id,
+        "key": item.key,
+        "name": item.name,
+        "description": item.description,
+        "category": item.category,
+        "price": final_price,
+        "original_price": price if item.discount_percent else None,
+        "discount_percent": item.discount_percent,
+        "css_value": item.css_value,
+        "badge_text": item.badge_text,
+        "badge_color": item.badge_color,
+        "xp_amount": item.xp_amount,
+        "is_active": item.is_active,
+    }
+
+
+class ShopPurchaseRequest(BaseModel):
+    item_key: str | None = None
+    plan: str | None = None
+
+
+class ShopEquipRequest(BaseModel):
+    category: str  # frame / name_color / title
+    shop_item_id: int | None = None  # None для unequip
+
+
+@app.get("/api/shop/catalog")
+async def shop_catalog(db: Session = Depends(get_db)):
+    """Каталог магазина — доступен всем вошедшим. Только активные товары."""
+    items = db.query(ShopItem).filter(ShopItem.is_active == True).order_by(ShopItem.sort_order).all()  # noqa: E712
+    return {
+        "items": [serialize_shop_item(i) for i in items],
+        "premium_plans": PREMIUM_PLANS,
+    }
+
+
+@app.get("/api/shop/inventory")
+async def shop_inventory(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Всё, чем реально владеет пользователь, плюс что сейчас надето."""
+    rows = (
+        db.query(UserInventoryItem)
+        .options(joinedload(UserInventoryItem.item))
+        .filter(UserInventoryItem.user_id == current_user.id)
+        .all()
+    )
+    return {
+        "items": [serialize_shop_item(r.item) for r in rows if r.item],
+        "active_frame": current_user.active_frame,
+        "active_name_color": current_user.active_name_color,
+    }
+
+
+@app.post("/api/shop/equip")
+async def shop_equip(
+    req: ShopEquipRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Надеть/снять купленное украшение. Владение проверяется на сервере — подделать нельзя."""
+    if req.category not in ("frame", "name_color", "title"):
+        raise HTTPException(status_code=400, detail="Неизвестная категория")
+
+    if req.shop_item_id is None:
+        # Снять
+        if req.category == "frame":
+            current_user.active_frame = None
+        elif req.category == "name_color":
+            current_user.active_name_color = None
+        elif req.category == "title":
+            current_user.badge_text = None
+            current_user.badge_color = None
+        db.commit()
+        return {"status": "unequipped"}
+
+    owned = (
+        db.query(UserInventoryItem)
+        .join(ShopItem, UserInventoryItem.shop_item_id == ShopItem.id)
+        .filter(
+            UserInventoryItem.user_id == current_user.id,
+            UserInventoryItem.shop_item_id == req.shop_item_id,
+            ShopItem.category == req.category,
+        )
+        .first()
+    )
+    if not owned:
+        raise HTTPException(status_code=403, detail="Этот предмет не куплен")
+
+    item = owned.item
+    if req.category == "frame":
+        current_user.active_frame = item.css_value
+    elif req.category == "name_color":
+        current_user.active_name_color = item.css_value
+    elif req.category == "title":
+        current_user.badge_text = item.badge_text
+        current_user.badge_color = item.badge_color
+    db.commit()
+    return {"status": "equipped"}
+
+
+@app.get("/api/shop/subscription")
+async def shop_subscription(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    sub = get_active_subscription(db, current_user)
+    return {
+        "is_active": sub is not None,
+        "expires_at": sub.expires_at if sub else None,
+        "auto_renew": sub.auto_renew if sub else None,
+    }
+
+
+@app.get("/api/shop/my-purchases")
+async def shop_my_purchases(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(ShopPurchase)
+        .filter(ShopPurchase.user_id == current_user.id)
+        .order_by(ShopPurchase.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": p.id,
+            "item_name": p.item_name,
+            "price": p.price,
+            "status": p.status,
+            "created_at": p.created_at,
+        }
+        for p in rows
+    ]
+
+
+@app.post("/api/shop/purchase")
+async def shop_purchase(
+    req: ShopPurchaseRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Оформляет заявку на покупку (товар или Premium). Реальную оплату обсуждаете отдельно
+    (кнопка «Связь со мной») — после получения денег админ подтверждает заявку в панели."""
+    shop_item = None
+    plan = None
+
+    if req.plan:
+        plan_info = PREMIUM_PLANS.get(req.plan)
+        if not plan_info:
+            raise HTTPException(status_code=404, detail="Такого плана подписки нет")
+        item_name, price, plan = plan_info["name"], plan_info["price"], req.plan
+    elif req.item_key:
+        shop_item = db.query(ShopItem).filter(ShopItem.key == req.item_key, ShopItem.is_active == True).first()  # noqa: E712
+        if not shop_item:
+            raise HTTPException(status_code=404, detail="Товар не найден")
+        item_name = shop_item.name
+        price = round(shop_item.price * (100 - shop_item.discount_percent) / 100) if shop_item.discount_percent else shop_item.price
+    else:
+        raise HTTPException(status_code=400, detail="Не указан товар или план подписки")
+
+    if shop_item and shop_item.category != "xp" and shop_item.category != "premium":
+        already_owned = (
+            db.query(UserInventoryItem)
+            .filter(UserInventoryItem.user_id == current_user.id, UserInventoryItem.shop_item_id == shop_item.id)
+            .first()
+        )
+        if already_owned:
+            raise HTTPException(status_code=400, detail="У тебя уже есть этот предмет")
+
+    existing_pending = db.query(ShopPurchase).filter(
+        ShopPurchase.user_id == current_user.id,
+        ShopPurchase.status == "pending",
+        ShopPurchase.item_name == item_name,
+    ).first()
+    if existing_pending:
+        raise HTTPException(status_code=400, detail="Заявка на это уже отправлена, ждём подтверждения оплаты")
+
+    purchase = ShopPurchase(
+        user_id=current_user.id,
+        shop_item_id=shop_item.id if shop_item else None,
+        item_name=item_name,
+        price=price,
+        plan=plan,
+    )
+    db.add(purchase)
+    db.commit()
+    db.refresh(purchase)
+    logging.info(f"[shop] Заявка #{purchase.id}: {author_display_name(current_user)} -> «{item_name}» за {price}₽")
+
+    if ADMIN_TELEGRAM_ID:
+        admin = db.query(User).filter(User.telegram_id == ADMIN_TELEGRAM_ID).first()
+        if admin:
+            notify(db, admin, f"🛍 Новая заявка на покупку: {author_display_name(current_user)} хочет «{item_name}» за {price}₽")
+
+    return {"status": "pending", "purchase_id": purchase.id, "item_name": item_name, "price": price}
+
+
+# ---- Админ: управление товарами ----
+
+class ShopItemCreateRequest(BaseModel):
+    key: str
+    name: str
+    description: str | None = None
+    category: str
+    price: int
+    discount_percent: int = 0
+    css_value: str | None = None
+    badge_text: str | None = None
+    badge_color: str | None = None
+    xp_amount: int | None = None
+    is_active: bool = True
+
+
+class ShopItemUpdateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    price: int | None = None
+    discount_percent: int | None = None
+    css_value: str | None = None
+    badge_text: str | None = None
+    badge_color: str | None = None
+    xp_amount: int | None = None
+    is_active: bool | None = None
+
+
+@app.get("/api/admin/shop/items")
+async def admin_shop_items(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    items = db.query(ShopItem).order_by(ShopItem.category, ShopItem.sort_order).all()
+    return [serialize_shop_item(i) | {"key": i.key} for i in items]
+
+
+@app.post("/api/admin/shop/items")
+async def admin_create_shop_item(
+    req: ShopItemCreateRequest,
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    if db.query(ShopItem).filter(ShopItem.key == req.key).first():
+        raise HTTPException(status_code=400, detail="Товар с таким ключом уже есть")
+    item = ShopItem(**req.dict())
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return serialize_shop_item(item)
+
+
+@app.patch("/api/admin/shop/items/{item_id}")
+async def admin_update_shop_item(
+    item_id: int,
+    req: ShopItemUpdateRequest,
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    item = db.query(ShopItem).filter(ShopItem.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Товар не найден")
+    for field, value in req.dict(exclude_unset=True).items():
+        setattr(item, field, value)
+    db.commit()
+    return serialize_shop_item(item)
+
+
+@app.delete("/api/admin/shop/items/{item_id}")
+async def admin_delete_shop_item(
+    item_id: int,
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    item = db.query(ShopItem).filter(ShopItem.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Товар не найден")
+    owned_count = db.query(UserInventoryItem).filter(UserInventoryItem.shop_item_id == item_id).count()
+    if owned_count > 0:
+        item.is_active = False
+        db.commit()
+        return {"status": "deactivated", "reason": f"Товар уже куплен {owned_count} пользователями — скрыт вместо удаления"}
+    db.delete(item)
+    db.commit()
+    return {"status": "deleted"}
+
+
+# ---- Админ: заявки на покупку ----
+
+@app.get("/api/admin/shop/purchases")
+async def admin_shop_purchases(
+    status: str = "pending",
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    query = db.query(ShopPurchase).options(joinedload(ShopPurchase.user))
+    if status != "all":
+        query = query.filter(ShopPurchase.status == status)
+    rows = query.order_by(ShopPurchase.created_at.desc()).limit(150).all()
+    return [
+        {
+            "id": p.id,
+            "user_id": p.user_id,
+            "user_name": author_display_name(p.user),
+            "item_name": p.item_name,
+            "price": p.price,
+            "status": p.status,
+            "created_at": p.created_at,
+        }
+        for p in rows
+    ]
+
+
+@app.post("/api/admin/shop/purchases/{purchase_id}/fulfill")
+async def admin_fulfill_purchase(
+    purchase_id: int,
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    purchase = db.query(ShopPurchase).options(joinedload(ShopPurchase.item)).filter(ShopPurchase.id == purchase_id).first()
+    if not purchase:
+        raise HTTPException(status_code=404, detail="Заявка не найдена")
+    if purchase.status != "pending":
+        raise HTTPException(status_code=400, detail="Заявка уже обработана")
+
+    target = db.query(User).filter(User.id == purchase.user_id).first()
+    if target:
+        apply_purchased_item(db, target, purchase)
+        notify(db, target, f"✅ Оплата подтверждена! «{purchase.item_name}» уже у тебя 🎉")
+    purchase.status = "fulfilled"
+    db.commit()
+    logging.info(f"[shop] Заявка #{purchase.id} подтверждена админом {author_display_name(current_user)}")
+    return {"status": "fulfilled"}
+
+
+@app.post("/api/admin/shop/purchases/{purchase_id}/cancel")
+async def admin_cancel_purchase(
+    purchase_id: int,
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    purchase = db.query(ShopPurchase).filter(ShopPurchase.id == purchase_id).first()
+    if not purchase:
+        raise HTTPException(status_code=404, detail="Заявка не найдена")
+    purchase.status = "cancelled"
+    db.commit()
+    logging.info(f"[shop] Заявка #{purchase.id} отменена админом {author_display_name(current_user)}")
+    return {"status": "cancelled"}
+
+
+@app.get("/api/admin/shop/stats")
+async def admin_shop_stats(current_user: User = Depends(require_admin), db: Session = Depends(get_db)):
+    fulfilled = db.query(ShopPurchase).filter(ShopPurchase.status == "fulfilled").all()
+    total_revenue = sum(p.price for p in fulfilled)
+    by_item: dict[str, dict] = {}
+    for p in fulfilled:
+        bucket = by_item.setdefault(p.item_name, {"item_name": p.item_name, "count": 0, "revenue": 0})
+        bucket["count"] += 1
+        bucket["revenue"] += p.price
+    active_subs = db.query(Subscription).filter(Subscription.expires_at > datetime.now(timezone.utc)).count()
+    return {
+        "total_revenue": total_revenue,
+        "total_sales": len(fulfilled),
+        "pending_count": db.query(ShopPurchase).filter(ShopPurchase.status == "pending").count(),
+        "active_subscriptions": active_subs,
+        "by_item": sorted(by_item.values(), key=lambda x: -x["revenue"]),
+    }
